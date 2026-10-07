@@ -119,13 +119,21 @@ success, so there is nothing to pull; fix the logged error and re-run.
    clone dir. `Ctrl+C` cancels the run first (`gh run cancel`), then
    cleans up. `main`/`master` are never touched.
 
-Workflow details (`build.yml`): `workflow_dispatch`, `permissions:
-contents: read`, checks out the temp branch, installs any requested
-apt packages, auto-detects Rust (`Cargo.toml`, respects
+Workflow details (`build.yml`): `workflow_dispatch` with per-project
+cache key `remote-build-cache-<slug>-<lock>-<cmd>`, `permissions:
+contents: read, actions: read`, checks out the temp branch, restores
+the shared cache (read-only — temp branches can only read main-scope
+entries), auto-detects Rust (`Cargo.toml`, respects
 `rust-toolchain.toml`) / Go (`go.mod`) / Node (`package.json`), runs
-your command, uploads `remote-build-binary-<build_id>`
-(`retention-days: 1`). No caching: every build compiles cold on a
-fresh worker.
+your command, uploads `remote-build-binary-<build_id>` plus a
+`cache-payload-<slug>` (both `retention-days: 1`). Apt packages get
+their own shared entry (`remote-build-apt-<hash>`, one per package
+list across all projects): the `.deb` files and package lists are
+cached too, so repeat installs skip `apt-get update` and all downloads.
+After success the client dispatches `seed-cache.yml` on `main`, which
+saves the payload to main-scope cache so the next build of the same
+project is warm (`--no-seed` skips this; the `seed` stage shows in the
+final timing breakdown).
 
 ## 4. Troubleshooting
 
