@@ -517,6 +517,22 @@ def cache_key_for(project_root, command):
     return slug, lock16, cmd12, key, f"remote-build-cache-{slug}-"
 
 
+def purge_cache_payload(out_dir):
+    """Remove downloaded `cache-payload-*` entries (dependency tarballs
+    for the seeder, not build outputs). They arrive only via the
+    download-all fallback; the binary output must never contain them."""
+    for p in sorted(out_dir.iterdir()):
+        if p.name.startswith("cache-payload-"):
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            log(f"discarded cache payload: {p.name}")
+
+
 def list_branch_runs(repo, branch, limit=10, workflow=WORKFLOW_FILE):
     """All run IDs on a branch (dispatch + push siblings). Never raises."""
     try:
@@ -1010,8 +1026,14 @@ def main(argv=None):
                 "-n", artifact, "-D", str(out_dir), check=False,
                 timeout=600)
         if dl.returncode != 0:
+            # Exact name misses on runs from older workflows (fixed
+            # `remote-build-binary` name) or manual dispatches without
+            # inputs (artifact falls back to the run id). Pulling
+            # everything still gets the binary -- plus the cache
+            # payload, which is discarded right after.
             log("exact artifact name not found; downloading all "
-                "artifacts for the run...")
+                "artifacts for the run (cache payload will be "
+                "discarded)...")
             dl = gh("run", "download", run_id, "--repo", repo,
                     "-D", str(out_dir), check=False, timeout=600)
             if dl.returncode != 0:
@@ -1030,6 +1052,7 @@ def main(argv=None):
                     return 0
                 err("artifact download failed (nothing uploaded?).")
                 return 1
+        purge_cache_payload(out_dir)
         flatten_output_dir(out_dir, before)
         files = [p for p in out_dir.rglob("*") if p.is_file()]
         if not files:
