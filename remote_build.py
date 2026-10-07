@@ -1014,44 +1014,58 @@ def main(argv=None):
                 print(error_section(cleaned), end="")
             return 1
 
-        # 14-16. Success: download compiled binary. Check-type commands
-        # (e.g. `cargo check`) intentionally produce no binary: the
-        # workflow then uploads nothing, which is a successful outcome,
-        # not an error.
+        # 14-16. Success: download the BINARY artifact strictly by name.
+        # The run may also hold a cache-payload artifact (dependency
+        # tarballs for the seeder); it must never be mistaken for the
+        # binary. Names are resolved via the API first, so at most one
+        # artifact is ever downloaded.
         out_dir = (project_root / args.output)
         out_dir.mkdir(parents=True, exist_ok=True)
         before = {p.name for p in out_dir.iterdir()}
-        log(f"downloading artifact {artifact}...")
+        try:
+            names = gh("api", f"repos/{repo}/actions/runs/{run_id}/"
+                              f"artifacts",
+                       "--jq", ".artifacts[].name",
+                       timeout=120).stdout.split()
+        except RuntimeError:
+            names = None
+        binary = None
+        if names is not None:
+            if artifact in names:
+                binary = artifact
+            else:
+                legacy = [n for n in names
+                          if n == "remote-build-binary"
+                          or n.startswith("remote-build-binary-")]
+                if legacy:
+                    binary = sorted(legacy)[0]
+                    log(f"exact artifact name not found; using {binary}...")
+        if binary is None:
+            # No binary artifact at all: either a check-type command
+            # (nothing to download -- still a success, and seeding can
+            # use the payload), or something is genuinely wrong.
+            has_payload = bool(names) and any(
+                n.startswith("cache-payload-") for n in names)
+            if has_payload:
+                say("remote build SUCCEEDED (no binary artifact: "
+                    "expected for check-type commands such as "
+                    "`cargo check`; nothing to download).")
+                seed_shared_cache(repo, run_id, slug, cache_key, apt_key,
+                                  state, no_seed=args.no_seed)
+                return 0
+            if names == []:
+                say("remote build SUCCEEDED (no artifacts uploaded; "
+                    "nothing to download).")
+                return 0
+            err("artifact download failed (nothing uploaded?).")
+            return 1
+        log(f"downloading artifact {binary}...")
         dl = gh("run", "download", run_id, "--repo", repo,
-                "-n", artifact, "-D", str(out_dir), check=False,
+                "-n", binary, "-D", str(out_dir), check=False,
                 timeout=600)
         if dl.returncode != 0:
-            # Exact name misses on runs from older workflows (fixed
-            # `remote-build-binary` name) or manual dispatches without
-            # inputs (artifact falls back to the run id). Pulling
-            # everything still gets the binary -- plus the cache
-            # payload, which is discarded right after.
-            log("exact artifact name not found; downloading all "
-                "artifacts for the run (cache payload will be "
-                "discarded)...")
-            dl = gh("run", "download", run_id, "--repo", repo,
-                    "-D", str(out_dir), check=False, timeout=600)
-            if dl.returncode != 0:
-                try:
-                    total = gh("api",
-                               f"repos/{repo}/actions/runs/{run_id}/"
-                               f"artifacts",
-                               "--jq", ".total_count",
-                               timeout=120).stdout.strip()
-                except RuntimeError:
-                    total = ""
-                if total == "0":
-                    say("remote build SUCCEEDED (no binary artifact: "
-                        "expected for check-type commands such as "
-                        "`cargo check`; nothing to download).")
-                    return 0
-                err("artifact download failed (nothing uploaded?).")
-                return 1
+            err("artifact download failed (nothing uploaded?).")
+            return 1
         purge_cache_payload(out_dir)
         flatten_output_dir(out_dir, before)
         files = [p for p in out_dir.rglob("*") if p.is_file()]
