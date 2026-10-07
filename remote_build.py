@@ -601,13 +601,12 @@ def wait_for_binary_artifact(repo, run_id, artifact, timeout_s=300):
     while time.time() < deadline:
         try:
             r = gh("api", f"repos/{repo}/actions/runs/{run_id}/artifacts",
-                   "--jq", ".artifacts[] | "
-                           "\\(.id) \\(.name) expired=\\(.expired)",
+                   "--jq", ".artifacts[] | [.id, .name, .expired] | @tsv",
                    timeout=120)
             entries = []
             for line in r.stdout.splitlines():
-                parts = line.split()
-                if len(parts) >= 2 and "expired=true" not in line:
+                parts = line.split("\t")
+                if len(parts) >= 2 and parts[2:3] != ["true"]:
                     entries.append((parts[0], parts[1]))
         except RuntimeError:
             time.sleep(10)
