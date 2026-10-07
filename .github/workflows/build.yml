@@ -372,6 +372,11 @@ jobs:
             mkdir -p apt-stage/lists apt-stage/archives
             sudo cp /var/lib/apt/lists/* apt-stage/lists/ 2>/dev/null || true
             sudo cp /var/cache/apt/archives/*.deb apt-stage/archives/ 2>/dev/null || true
+            # lock/partial files are root-only runtime state (tar as
+            # runner cannot read them) and worthless for reinstall.
+            sudo rm -rf apt-stage/lists/lock apt-stage/lists/partial \
+              apt-stage/archives/lock apt-stage/archives/partial \
+              2>/dev/null || true
             printf '%s' "$REMOTE_BUILD_APT" > apt-stage/marker.txt
             if ls apt-stage/archives/*.deb >/dev/null 2>&1; then
               tar -czf cache-out/apt-cache.tar.gz -C apt-stage lists archives marker.txt || true
