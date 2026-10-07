@@ -3,13 +3,7 @@ name: Remote build
 # Dispatch-only: the client triggers exactly one run per build with
 # `gh workflow run build.yml --ref <temp-branch>`. Pushing the temp
 # branch alone triggers nothing, so each build costs one run.
-#
-# Caching model (see seed-cache.yml): temp branches can only READ
-# caches from their own branch or the default branch, never from
-# sibling temp branches. So this workflow only RESTORES (exact key,
-# then per-project prefix fallbacks); a short `seed-cache` run on
-# `main` SAVES to main scope after each successful build, making the
-# next build of the same project warm.
+# No caching: every build compiles cold on a fresh worker.
 # ("on" is quoted: plain `on:` parses as boolean true in YAML 1.1.)
 "on":
   workflow_dispatch:
@@ -28,33 +22,11 @@ name: Remote build
         required: false
         default: ""
         type: string
-      apt_hash:
-        description: "12-hex fingerprint of the apt package list"
-        required: false
-        default: ""
-        type: string
-      cache_slug:
-        description: "Stable per-project cache namespace (e.g. rust-mu)"
-        required: false
-        default: ""
-        type: string
-      cache_lock:
-        description: "16-hex lockfile fingerprint (deterministic per deps)"
-        required: false
-        default: ""
-        type: string
-      cache_cmd:
-        description: "12-hex build-command fingerprint (debug vs release)"
-        required: false
-        default: ""
-        type: string
 
-# Minimal permissions: read the uploaded source and read shared caches.
-# Never pushes, never deletes branches, never writes caches (the
-# main-scope seeder does the saving).
+# Minimal permissions: read the uploaded source, build it, upload a
+# short-lived artifact. Never pushes, never deletes branches.
 permissions:
   contents: read
-  actions: read
 
 jobs:
   build:
@@ -121,99 +93,13 @@ jobs:
           echo "Resolved command:  $CMD"
           echo "Resolved apt:      ${APT:-<none>}"
 
-          # Shared-cache key: remote-build-cache-<slug>-<lock16>-<cmd12>.
-          # Inputs (computed deterministically by the client) win; else
-          # compute locally so manual dispatches still work. Slug =
-          # stable project identity (NOT the per-build ID); lock = deps;
-          # cmd = profile (check vs release must not share a target/).
-          SLUG="${{ inputs.cache_slug }}"
-          if [ -z "$SLUG" ]; then
-            SLUG="unknown"
-            if [ -f project/Cargo.toml ]; then
-              NAME="$(sed -n -E 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' project/Cargo.toml 2>/dev/null | head -n 1)"
-              SLUG="rust-${NAME:-unknown}"
-            elif [ -f project/go.mod ]; then
-              MOD="$(sed -n -E 's/^module[[:space:]]+([^[:space:]]+).*/\1/p' project/go.mod 2>/dev/null | head -n 1)"
-              MOD="${MOD##*/}"
-              SLUG="go-${MOD:-unknown}"
-            elif [ -f project/package.json ]; then
-              NAME="$(sed -n -E 's/^[[:space:]]*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' project/package.json 2>/dev/null | head -n 1)"
-              NAME="${NAME##*/}"
-              SLUG="node-${NAME:-unknown}"
-            fi
-            SLUG="$(echo "$SLUG" | tr -c 'A-Za-z0-9_-' '-' | cut -c1-48 | sed -E 's/^-+//; s/-+$//')"
-            if [ -z "$SLUG" ]; then SLUG="unknown"; fi
-          fi
-          LOCK="${{ inputs.cache_lock }}"
-          if [ -z "$LOCK" ]; then
-            if ls project/Cargo.lock project/go.sum project/package-lock.json >/dev/null 2>&1; then
-              LOCK="$(cat project/Cargo.lock project/go.sum project/package-lock.json 2>/dev/null | sha256sum | cut -c1-16)"
-            else
-              LOCK="nolock"
-            fi
-          fi
-          CMDHASH="${{ inputs.cache_cmd }}"
-          if [ -z "$CMDHASH" ]; then
-            CMDHASH="$(printf '%s' "$CMD" | sha256sum | cut -c1-12)"
-          fi
-          CACHE_KEY="remote-build-cache-${SLUG}-${LOCK}-${CMDHASH}"
-          CACHE_PREFIX="remote-build-cache-${SLUG}-"
-          echo "cache_slug=$SLUG" >> "$GITHUB_OUTPUT"
-          echo "cache_key=$CACHE_KEY" >> "$GITHUB_OUTPUT"
-          echo "cache_prefix=$CACHE_PREFIX" >> "$GITHUB_OUTPUT"
-          echo "REMOTE_BUILD_CACHE_KEY=$CACHE_KEY" >> "$GITHUB_ENV"
-          echo "REMOTE_BUILD_CACHE_PREFIX=$CACHE_PREFIX" >> "$GITHUB_ENV"
-          echo "Cache key:    $CACHE_KEY"
-          echo "Cache prefix: $CACHE_PREFIX"
-
-          # Apt cache key: shared across PROJECTS using the same package
-          # list (unlike the project cache). Empty when no apt packages
-          # requested -- then no apt caching happens at all.
-          APT_KEY=""
-          if [ -n "$APT" ]; then
-            APTHASH="${{ inputs.apt_hash }}"
-            if [ -z "$APTHASH" ]; then
-              APTHASH="$(printf '%s' "$APT" | sha256sum | cut -c1-12)"
-            fi
-            APT_KEY="remote-build-apt-${APTHASH}"
-          fi
-          echo "apt_key=$APT_KEY" >> "$GITHUB_OUTPUT"
-          echo "REMOTE_BUILD_APT_KEY=$APT_KEY" >> "$GITHUB_ENV"
-          echo "Apt cache key: ${APT_KEY:-<none>}"
-
-      - name: Prepare apt cache directory
-        if: steps.resolve.outputs.apt_key != ''
-        run: mkdir -p apt-cache
-
-      - name: Restore apt package cache
-        if: steps.resolve.outputs.apt_key != ''
-        uses: actions/cache/restore@v4
-        with:
-          # .deb files + package lists, seeded to main scope by the
-          # seed-cache run. Hit => install from local debs with NO
-          # apt-get update and NO downloads (the 1m53s step drops to
-          # seconds of dpkg configure).
-          path: apt-cache
-          key: ${{ steps.resolve.outputs.apt_key }}
-          fail-on-cache-miss: false
-
       - name: Install system dependencies
         run: |
           if [ -n "$REMOTE_BUILD_APT" ]; then
-            if [ -f apt-cache/marker.txt ] && [ "$(cat apt-cache/marker.txt)" = "$REMOTE_BUILD_APT" ] \
-               && ls apt-cache/archives/*.deb >/dev/null 2>&1; then
-              echo "Apt cache hit: installing from cached .debs (no update, no downloads)."
-              sudo cp apt-cache/lists/* /var/lib/apt/lists/ 2>/dev/null || true
-              sudo cp apt-cache/archives/*.deb /var/cache/apt/archives/ 2>/dev/null || true
-              # shellcheck disable=SC2086
-              sudo apt-get install -y $REMOTE_BUILD_APT
-            else
-              echo "Apt cache miss: updating package lists and downloading."
-              echo "(this is the slow path, ~2 min, only until seeded)"
-              sudo apt-get update -qq
-              # shellcheck disable=SC2086
-              sudo apt-get install -y $REMOTE_BUILD_APT
-            fi
+            echo "Installing system packages: $REMOTE_BUILD_APT"
+            sudo apt-get update -qq
+            # shellcheck disable=SC2086
+            sudo apt-get install -y $REMOTE_BUILD_APT
           else
             echo "No extra system packages requested."
           fi
@@ -259,18 +145,13 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: project/go.mod
-          # Built-in caching disabled: module/build caches are covered
-          # by the explicit shared-cache restore below (saves would land
-          # on the throwaway branch scope and never be reused).
-          cache: false
+          cache: false # no caching: every build compiles cold
 
       - name: Set up Node.js
         if: steps.detect.outputs.node == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: 24
-          # No built-in cache: the npm store is covered by the explicit
-          # shared-cache restore below (same branch-scope reason).
 
       - name: Show toolchain versions
         run: |
@@ -281,35 +162,6 @@ jobs:
           npm --version 2>/dev/null || true
           if [ -f project/rust-toolchain.toml ]; then echo "--- rust-toolchain.toml ---"; cat project/rust-toolchain.toml; fi
           if [ -f project/rust-toolchain ]; then echo "--- rust-toolchain ---"; cat project/rust-toolchain; fi
-
-      - name: Prepare cache directories
-        run: |
-          # actions/cache errors when none of its paths exist; a cold
-          # worker with a fresh checkout has none of these yet.
-          mkdir -p project/target apt-cache ~/.cargo/registry ~/.cargo/git \
-            ~/go/pkg/mod ~/.cache/go-build ~/.npm
-
-      - name: Restore shared cache (main scope)
-        uses: actions/cache/restore@v4
-        with:
-          # Exact key first (same project + deps + command), then the
-          # per-project prefix (same project, older deps), then anything.
-          # Cargo/Go fingerprints make cross-project restores safe: stale
-          # entries only cost a rebuild, never a wrong binary.
-          # Read-only: temp branches cannot write usable entries, so the
-          # seed-cache workflow on main does all the saving.
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/go/pkg/mod
-            ~/.cache/go-build
-            ~/.npm
-            project/target
-          key: ${{ steps.resolve.outputs.cache_key }}
-          restore-keys: |
-            ${{ steps.resolve.outputs.cache_prefix }}
-            remote-build-cache-
-          fail-on-cache-miss: false
 
       - name: Build uploaded project
         run: |
@@ -344,68 +196,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 1
 
-      - name: Pack cache payload
-        id: payload
-        if: success()
-        run: |
-          # Bundle everything worth reusing (registries, module stores,
-          # compiled target/) into two trees: $HOME content and workspace
-          # content. The seed-cache run on main downloads this artifact
-          # and saves it to main-scope cache; the temp run itself can
-          # never write a reusable entry. Skipped when absurdly large.
-          mkdir -p cache-out
-          (
-            cd "$HOME"
-            divulge() { [ -e "$1" ] && echo "$1"; }
-            # shellcheck disable=SC2046
-            tar -czf "$GITHUB_WORKSPACE/cache-out/home-cache.tar.gz" \
-              $(divulge .cargo/registry) $(divulge .cargo/git) \
-              $(divulge go/pkg/mod) $(divulge .cache/go-build) \
-              $(divulge .npm) || true
-          )
-          if [ -d project/target ]; then
-            tar -czf cache-out/ws-cache.tar.gz -C "$GITHUB_WORKSPACE" project/target || true
-          fi
-          # Apt .debs + package lists + the exact package string that
-          # produced them (marker guards against list mismatches).
-          if [ -n "$REMOTE_BUILD_APT" ]; then
-            mkdir -p apt-stage/lists apt-stage/archives
-            sudo cp /var/lib/apt/lists/* apt-stage/lists/ 2>/dev/null || true
-            sudo cp /var/cache/apt/archives/*.deb apt-stage/archives/ 2>/dev/null || true
-            # lock/partial files are root-only runtime state (tar as
-            # runner cannot read them) and worthless for reinstall.
-            sudo rm -rf apt-stage/lists/lock apt-stage/lists/partial \
-              apt-stage/archives/lock apt-stage/archives/partial \
-              2>/dev/null || true
-            printf '%s' "$REMOTE_BUILD_APT" > apt-stage/marker.txt
-            if ls apt-stage/archives/*.deb >/dev/null 2>&1; then
-              tar -czf cache-out/apt-cache.tar.gz -C apt-stage lists archives marker.txt || true
-            fi
-            rm -rf apt-stage
-          fi
-          ls -la cache-out/ || true
-          TOTAL="$(du -sb cache-out 2>/dev/null | cut -f1)"
-          COUNT="$(find cache-out -type f 2>/dev/null | wc -l)"
-          echo "payload_bytes=${TOTAL:-0}" >> "$GITHUB_OUTPUT"
-          echo "payload_files=${COUNT:-0}" >> "$GITHUB_OUTPUT"
-          echo "Payload: ${COUNT:-0} file(s), ${TOTAL:-0} bytes"
-          if [ "${TOTAL:-0}" -gt 2000000000 ]; then
-            echo "Payload over 2 GB cap; skipping cache upload."
-            rm -rf cache-out
-            echo "payload_files=0" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Upload cache payload
-        if: success() && steps.payload.outputs.payload_files != '0'
-        uses: actions/upload-artifact@v4
-        with:
-          name: cache-payload-${{ steps.resolve.outputs.cache_slug }}
-          path: cache-out/
-          if-no-files-found: ignore
-          retention-days: 1
-
       - name: Clean temporary workspace
         if: always()
         run: |
-          rm -rf dist cache-out || true
+          rm -rf dist || true
           echo "Runner workspace cleaned."

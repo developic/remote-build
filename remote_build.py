@@ -19,7 +19,6 @@ Standard library only; GitHub auth is delegated to the `gh` CLI.
 import argparse
 import datetime
 import fnmatch
-import hashlib
 import json
 import os
 import random
@@ -470,54 +469,6 @@ def flatten_output_dir(out_dir, before):
         shutil.rmtree(sub, ignore_errors=True)
 
 
-def cache_key_for(project_root, command):
-    """Deterministic shared-cache key, mirroring the workflow's resolve
-    step: remote-build-cache-<slug>-<lock16>-<cmd12>.
-
-    Slug = stable project identity (manifest name), lock = deps,
-    cmd = build profile. Must be identical across rebuilds of the same
-    project -- never the per-build ID.
-    """
-    name = ""
-    cargo = project_root / "Cargo.toml"
-    gomod = project_root / "go.mod"
-    pkg = project_root / "package.json"
-    try:
-        if cargo.is_file():
-            m = re.search(r"(?m)^[ \t]*name[ \t]*=[ \t]*\"([^\"]+)\"",
-                          cargo.read_text(errors="replace"))
-            name = "rust-" + (m.group(1) if m else "unknown")
-        elif gomod.is_file():
-            m = re.search(r"(?m)^module[ \t]+([^ \t]+)",
-                          gomod.read_text(errors="replace"))
-            mod = m.group(1) if m else "unknown"
-            name = "go-" + mod.rsplit("/", 1)[-1]
-        elif pkg.is_file():
-            m = re.search(r'(?m)^[ \t]*"name"[ \t]*:[ \t]*"([^"]+)"',
-                          pkg.read_text(errors="replace"))
-            mod = m.group(1) if m else "unknown"
-            name = "node-" + mod.rsplit("/", 1)[-1]
-    except OSError:
-        pass
-    if not name:
-        name = "unknown"
-    slug = re.sub(r"[^A-Za-z0-9_-]", "-", name)[:48].strip("-") or "unknown"
-    h = hashlib.sha256()
-    found = False
-    for lock in ("Cargo.lock", "go.sum", "package-lock.json"):
-        p = project_root / lock
-        try:
-            if p.is_file():
-                h.update(p.read_bytes())
-                found = True
-        except OSError:
-            pass
-    lock16 = h.hexdigest()[:16] if found else "nolock"
-    cmd12 = hashlib.sha256(command.encode()).hexdigest()[:12]
-    key = f"remote-build-cache-{slug}-{lock16}-{cmd12}"
-    return slug, lock16, cmd12, key, f"remote-build-cache-{slug}-"
-
-
 def purge_cache_payload(out_dir):
     """Remove downloaded `cache-payload-*` entries (dependency tarballs
     for the seeder, not build outputs). They arrive only via the
@@ -729,18 +680,13 @@ class Cleanup:
         self.run_id = None
         self.run_deleted = False
         self.branch_deleted = False
-        self.extra_runs = []  # e.g. the main-scope seeder run
 
     def cleanup(self, cancel_first=False):
         # Collect every run on the temp branch (normally exactly one)
-        # plus any explicitly tracked runs (e.g. the seeder on main),
         # so nothing is left behind.
         ids = []
         if self.run_id:
             ids.append(str(self.run_id))
-        for rid in self.extra_runs:
-            if str(rid) not in ids:
-                ids.append(str(rid))
         if self.branch and self.branch not in PROTECTED_BRANCHES:
             for rid in list_branch_runs(self.repo, self.branch):
                 if rid not in ids:
@@ -836,101 +782,6 @@ def find_run(repo, branch, since_epoch, timeout_s=120,
                        f"Actions tab).")
 
 
-def seed_shared_cache(repo, run_id, slug, cache_key, apt_key, state,
-                      no_seed=False, timeout_mins=15):
-    """Save this build's dependencies to main-scope cache for the next
-    build of the same project.
-
-    The temp run uploaded a `cache-payload-<slug>` artifact (registries,
-    target/). A short `seed-cache.yml` run ON the default branch
-    downloads it and saves it via actions/cache -- the save lands in
-    main scope, which every future temp branch can restore from. The
-    seeder run is registered for cleanup (cache entries survive run
-    deletion). Returns True when the next build can expect a warm
-    cache. Never raises; warns instead.
-    """
-    if no_seed:
-        log("cache seeding skipped (--no-seed).")
-        return False
-    try:
-        names = gh("api", f"repos/{repo}/actions/runs/{run_id}/artifacts",
-                   "--jq", ".artifacts[].name",
-                   timeout=120).stdout.split()
-    except RuntimeError as e:
-        log(f"WARNING: cannot list artifacts, skipping seeding: {e}")
-        return False
-    if f"cache-payload-{slug}" not in names:
-        log("no cache payload uploaded; skipping cache seeding.")
-        return False
-    try:
-        main = gh("repo", "view", repo, "--json", "defaultBranchRef",
-                  "--jq", ".defaultBranchRef.name").stdout.strip() or "main"
-    except RuntimeError:
-        main = "main"
-    since = time.time()
-    trig = gh("workflow", "run", "seed-cache.yml", "--ref", main,
-              "--repo", repo,
-              "-f", f"slug={slug}",
-              "-f", f"payload_run_id={run_id}",
-              "-f", f"cache_key={cache_key}",
-              "-f", f"apt_key={apt_key}", check=False)
-    if trig.returncode != 0:
-        log("WARNING: seed-cache dispatch failed; next build stays cold.")
-        return False
-    # Identify OUR seeder by its run title (several may share main).
-    deadline = time.time() + 180
-    seed_id = None
-    while time.time() < deadline:
-        r = gh("run", "list", "--workflow", "seed-cache.yml",
-               "--branch", main, "--limit", "10",
-               "--json", "databaseId,displayTitle,createdAt",
-               "--repo", repo, check=False)
-        try:
-            runs = json.loads(r.stdout or "[]")
-        except json.JSONDecodeError:
-            runs = []
-        mine = [x for x in runs
-                if str(run_id) in (x.get("displayTitle") or "")
-                and _ts(x.get("createdAt", "")) >= since - 30]
-        if mine:
-            seed_id = str(sorted(
-                mine, key=lambda x: x.get("createdAt", ""))[-1]["databaseId"])
-            break
-        time.sleep(5)
-    if seed_id is None:
-        log("WARNING: seeder run not found; next build stays cold.")
-        return False
-    state.extra_runs.append(seed_id)
-    say(f"seed run: https://github.com/{repo}/actions/runs/{seed_id}")
-    pulse_start("seeding shared cache on main")
-    try:
-        watch = gh("run", "watch", seed_id, "--repo", repo,
-                   "--exit-status", "--interval", "10",
-                   check=False, timeout=timeout_mins * 60 + 60)
-    finally:
-        pulse_stop()
-    try:
-        concl = gh("run", "view", seed_id, "--repo", repo,
-                   "--json", "conclusion",
-                   "--jq", ".conclusion").stdout.strip()
-    except RuntimeError:
-        concl = ""
-    if (watch.returncode == 0 and concl in ("", "success")) \
-            or concl == "success":
-        say(f"shared cache seeded: {cache_key}")
-        return True
-    log(f"WARNING: seeder {concl or 'failed'}; next build stays cold.")
-    return False
-
-
-def _ts(iso):
-    try:
-        return datetime.datetime.fromisoformat(
-            iso.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return 0
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Build current project files on GitHub Actions "
@@ -957,10 +808,6 @@ def main(argv=None):
                     help="print all progress lines (default is quiet: a "
                          "live one-line progress indicator plus errors "
                          "only)")
-    ap.add_argument("--no-seed", action="store_true",
-                    help="skip seeding the main-scope shared cache after "
-                         "a successful build (default seeds it, so the "
-                         "next build of the same project is warm)")
     args = ap.parse_args(argv)
     global _QUIET
     _QUIET = not args.verbose
@@ -995,15 +842,9 @@ def main(argv=None):
     project_root = Path.cwd()
     build_id, branch = generate_build_id()
     artifact = f"{ARTIFACT_PREFIX}-{build_id}"
-    slug, lock16, cmd12, cache_key, cache_prefix = cache_key_for(
-        project_root, args.command)
-    apt_hash = (hashlib.sha256(args.apt.encode()).hexdigest()[:12]
-                if args.apt.strip() else "")
-    apt_key = f"remote-build-apt-{apt_hash}" if apt_hash else ""
     log(f"build ID: {build_id}")
     log(f"branch:   {branch}")
     log(f"command:  {args.command}")
-    log(f"cache key: {cache_key}")
 
     if branch in PROTECTED_BRANCHES or build_id in PROTECTED_BRANCHES:
         err(f"refusing to use protected branch name {branch}")
@@ -1101,11 +942,7 @@ def main(argv=None):
                   "--repo", repo,
                   "-f", f"build_id={build_id}",
                   "-f", f"build_command={args.command}",
-                  "-f", f"apt_packages={args.apt}",
-                  "-f", f"cache_slug={slug}",
-                  "-f", f"cache_lock={lock16}",
-                  "-f", f"cache_cmd={cmd12}",
-                  "-f", f"apt_hash={apt_hash}", check=False)
+                  "-f", f"apt_packages={args.apt}", check=False)
         if trig.returncode != 0:
             raise RuntimeError(
                 "workflow_dispatch failed (build.yml is dispatch-only; "
@@ -1176,13 +1013,10 @@ def main(argv=None):
             if not ok:
                 return 1
         elif kind == "payload-only":
-            # Check-type command: nothing to download -- still a
-            # success, and seeding can use the payload.
+            # Check-type command: nothing to download -- still a success.
             say("remote build SUCCEEDED (no binary artifact: "
                 "expected for check-type commands such as "
                 "`cargo check`; nothing to download).")
-            seed_shared_cache(repo, run_id, slug, cache_key, apt_key,
-                              state, no_seed=args.no_seed)
             return 0
         elif kind == "empty":
             say("remote build SUCCEEDED (no artifacts uploaded; "
@@ -1199,8 +1033,6 @@ def main(argv=None):
             return 1
         for f in files:
             say(f"binary: {f} ({f.stat().st_size} bytes)")
-        seed_shared_cache(repo, run_id, slug, cache_key, apt_key, state,
-                          no_seed=args.no_seed)
         say("remote build SUCCEEDED.")
         return 0
     except SystemExit as e:
