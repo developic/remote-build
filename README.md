@@ -1,203 +1,129 @@
 # remote-rust-build
 
-Temporary remote Rust build machine powered by GitHub Actions.
+Temporary remote build machine powered by GitHub Actions. Rust is just
+the example — the same flow builds **Go, Node.js, or any command**.
 
-Run `./remote-build.sh` inside your Rust project and it will:
+From any project, run:
 
-```text
-pack local project
-→ send it to this repository on a temporary branch
-→ start GitHub Actions
-→ wait for the build
-→ show build errors
-→ return the correct exit code
-→ clean up all temporary data
+```bash
+python remote_build.py
 ```
 
-You never have to commit your Rust changes just to test-build them remotely.
+GitHub Actions builds your **exact current local files** — no commit in
+your project required. The temporary commit lives **only** in this
+dedicated build repository, on a unique throwaway branch that is
+deleted afterwards.
 
-## How it works
+```text
+local project
+  ↓ python makes temp .tar.gz (excludes .git/ target/ .env *.key *.pem)
+  ↓ temp branch remote-build-<id> in THIS repo
+  ↓ upload source into project/ + trigger build.yml (workflow_dispatch)
+  ↓ wait, print real compiler output
+  ↓ download binary on success
+  ↓ delete run (artifact+logs), delete branch, delete local temps
+```
 
-1. `remote-build.sh` (lives in your Rust project, copy it from this repo)
-   creates a `tar.gz` of the current filesystem state — uncommitted
-   changes included, `.git/` and `target/` excluded.
-2. It shallow-clones this repository, creates a unique branch
-   `remote-build/<timestamp>-<random>`, extracts your source into
-   `project/`, writes the requested cargo command to
-   `remote-build-command.txt`, commits, and pushes.
-3. Pushing a `remote-build/**` branch automatically triggers
-   `.github/workflows/build.yml` (`on: push`, no manual dispatch, no
-   invented ZIP-upload API).
-4. The script polls the run (matched by commit SHA, so concurrent builds
-   never mix), prints the real compiler log via `gh run view`, and sets
-   the exit code from the workflow conclusion.
-5. On success it optionally downloads the release binary artifact, then
-   deletes the temporary branch and all local temp files — on success,
-   failure, timeout, or `Ctrl+C` (via `trap`).
+Only three files exist:
 
-This repository stays clean: only `remote-build.sh`,
-`.github/workflows/build.yml`, and this README live here permanently.
-Every build's source, branch, and artifact are deleted afterwards.
+```text
+remote_build.py                # copy into any project (stdlib + gh CLI only)
+.github/workflows/build.yml   # cloud builder (this repo)
+README.md                      # this file
+```
 
-## Setup
+No `remote-build.sh`, no shell scripts, no hardcoded tokens, no
+releases / pull requests / issues / permanent tags.
 
-### 1. Create the dedicated GitHub repository
+## 1. Setup (once)
 
-Create an empty repo named `remote-rust-build` (private recommended,
-so your source is only visible to you) and push this project into it:
+Create the dedicated build repo (private recommended) and push these
+files to `main`:
 
 ```bash
 gh repo create OWNER/remote-rust-build --private --source=. --push
 ```
 
-Replace `OWNER` with your GitHub user or organization.
+Contents of `main` stay minimal: `remote_build.py`,
+`.github/workflows/build.yml`, `README.md`.
 
-### 2. Authenticate with `gh`
+## 2. Use (any project, any machine)
 
-```bash
-gh auth login
-```
-
-Verify with:
+Prerequisites: `python`, `git`, `gh`, and `gh auth login`.
 
 ```bash
-gh auth status
+export REMOTE_BUILD_REPO=OWNER/remote-rust-build
+cp /path/to/remote_build.py ./my-app/
+cd my-app
+python remote_build.py
 ```
 
-Never put tokens in the script. Auth comes from the GitHub CLI.
-
-### 3. Configure `REMOTE_BUILD_REPO`
+Examples:
 
 ```bash
-export REMOTE_BUILD_REPO="OWNER/remote-rust-build"
+python remote_build.py --command "cargo build --release"   # default
+python remote_build.py --command "cargo check"
+python remote_build.py --command "go build -o dist/app ./..."
+python remote_build.py --command "npm ci && npm run build"
+python remote_build.py --command "make release" --apt "libssl-dev"
 ```
 
-Optional variables (with defaults):
-
-```bash
-REMOTE_BUILD_WORKFLOW="build.yml"          # workflow file to watch
-REMOTE_BUILD_TIMEOUT=1800                  # seconds before giving up
-REMOTE_BUILD_COMMAND="cargo build --release"
-REMOTE_BUILD_APT_PACKAGES=""               # extra apt packages for the runner
-REMOTE_BUILD_DOWNLOAD_BINARY=1             # 1 = fetch binary, 0 = skip
-REMOTE_BUILD_OUTPUT_DIR="remote-build-output"
-```
-
-No `config.json`, no `.env` file needed.
-
-### 4. Make `remote-build.sh` executable
-
-Copy `remote-build.sh` from this repo into your Rust project root, then:
-
-```bash
-chmod +x remote-build.sh
-```
-
-### 5. Run the first build
-
-```bash
-cd my-rust-project
-./remote-build.sh
-```
-
-## Cleanup
-
-After every build the script deletes:
-
-- local temporary archive and directories (`mktemp -d`)
-- the temporary remote branch (`git push origin --delete`, idempotent)
-- the temporary uploaded source (it only ever existed on that branch)
-- the workflow artifact (after download, best effort, retention-days: 1)
-
-Cleanup runs via `trap ... EXIT INT TERM`, so it also happens when
-cargo fails, the workflow fails, the network fails, the timeout hits,
-or you press `Ctrl+C`. The runner itself is ephemeral; the workflow
-additionally tidies its workspace in an `always()` step.
-
-## Failure behavior
-
-If compilation fails:
-
-- no binary is downloaded,
-- the compiler errors from the remote log are printed,
-- the script exits non-zero (`echo $?` → non-zero),
-- everything is still cleaned up.
-
-Timeouts cancel the workflow run (`gh run cancel`) before cleanup.
-
-## Ctrl+C
-
-Pressing `Ctrl+C` stops the wait loop, cancels the GitHub Actions run
-if still in flight, deletes the temporary branch, removes local temp
-files, and exits cleanly.
-
-## Downloading the compiled binary
-
-With `cargo build --release` (the default) and
-`REMOTE_BUILD_DOWNLOAD_BINARY=1` (the default), the workflow uploads
-the release binary as the `remote-build-binary` artifact (retention:
-1 day) and the script downloads it to:
+Flags:
 
 ```text
-remote-build-output/remote-build-<timestamp>-<random>/
+--command TEXT     shell run as: cd project && <command>
+--repo OWNER/REPO  override $REMOTE_BUILD_REPO
+--apt "pkgs..."    extra apt packages (also $REMOTE_BUILD_APT_PACKAGES)
+--output DIR       binary download dir (default: remote-build-output/)
+--timeout-mins N   wait limit (default: 45)
 ```
 
-A unique subdirectory per build avoids overwriting unrelated files and
-keeps concurrent builds safe. With `cargo check` there is no binary,
-which is expected and not an error.
+Exit code mirrors the remote build: `0` on success, non-zero on
+failure. Compiler errors are printed locally via `gh run view --log`.
+On success the binary lands in `remote-build-output/`.
 
-Disable downloads with:
+## 3. How it works
 
-```bash
-REMOTE_BUILD_DOWNLOAD_BINARY=0 ./remote-build.sh
-```
+1. **Checks.** Verifies `python`/`git`/`gh`, runs `gh auth status`,
+   reads `$REMOTE_BUILD_REPO` (`OWNER/REPO`).
+2. **Archive.** Builds a temp `.tar.gz` of the working tree. Respects
+   `.gitignore` (via `git ls-files` when available) and always excludes
+   `.git/ target/ node_modules/ dist/ .env *.key *.pem` and similar
+   credential files. Your repo is never modified.
+3. **Temp branch.** Shallow-clones this repo to a temp dir, creates a
+   unique branch `remote-build-<utc>-<rand>`, extracts the archive into
+   `project/`, writes `remote-build-command.txt` /
+   `remote-build-apt.txt` / `remote-build-id.txt`, commits, pushes.
+4. **Trigger.** Runs the documented
+   `gh workflow run build.yml --ref <branch> -f build_id=... -f build_command=...`
+   (`push` on `remote-build/**` is a fallback trigger).
+5. **Find + wait.** Polls `gh run list --branch <branch>` — the branch
+   is unique, so concurrent builds never mix — then
+   `gh run watch --exit-status`.
+6. **Logs.** Prints `gh run view --log` (normal Cargo / go / npm output).
+7. **Download.** On success `gh run download -n remote-build-binary-<id>`.
+8. **Cleanup (always).** `gh run delete <id>` (removes artifact + logs),
+   deletes the temp branch via the API, removes the local archive and
+   clone dir. `Ctrl+C` cancels the run first (`gh run cancel`), then
+   cleans up. `main`/`master` are never touched.
 
-## Changing the build command
+Workflow details (`build.yml`): `workflow_dispatch` + `push`
+triggers, `permissions: contents: read`, checks out the temp branch,
+auto-detects Rust (`Cargo.toml`, respects `rust-toolchain.toml`) / Go
+(`go.mod`) / Node (`package.json`), runs your command, uploads
+`remote-build-binary-<build_id>` with `retention-days: 1`.
 
-```bash
-REMOTE_BUILD_COMMAND="cargo check" ./remote-build.sh
-REMOTE_BUILD_COMMAND="cargo build --release" ./remote-build.sh
-REMOTE_BUILD_COMMAND="cargo test --release" ./remote-build.sh
-```
+## 4. Troubleshooting
 
-## System libraries (apt packages)
+| Symptom | Why | Fix |
+|---|---|---|
+| `REMOTE_BUILD_REPO is not set` | env var missing | `export REMOTE_BUILD_REPO=OWNER/remote-rust-build` |
+| `gh: Not authenticated` | token expired | `gh auth login && gh auth status` |
+| `workflow not found / ref not found` | `build.yml` missing on `main`, or push failed | ensure workflow is on `main`; check push log |
+| `timed out waiting for run` | Actions disabled / queued | check repo Actions tab |
+| `error[E...]` / linker failure | your code, or missing sys lib | fix code, or `--apt "libssl-dev"` |
+| `artifact not found` | build failed so nothing uploaded | read the compiler log first; retry after fixing |
+| branch delete `422` warning | already deleted concurrently | safe to ignore |
 
-If your crate links a system C library (e.g. `mpv` via `libmpv-sys`,
-failing with `rust-lld: error: unable to find library -lmpv`), the
-default runner won't have it. Request it with:
-
-```bash
-REMOTE_BUILD_APT_PACKAGES="libmpv-dev" ./remote-build.sh
-```
-
-Multiple packages: `REMOTE_BUILD_APT_PACKAGES="libmpv-dev pkg-config"`.
-The workflow runs `sudo apt-get install -y` with your list before
-building; empty (the default) skips the step.
-
-The command runs from the uploaded project's root (`project/` in the
-runner). Any failure (non-zero cargo exit, workflow failure) makes the
-script exit non-zero, so it composes with other local automation.
-
-## Toolchain and caching
-
-- If your project has `rust-toolchain` / `rust-toolchain.toml`, the
-  workflow respects it (`dtolnay/rust-toolchain`); otherwise stable Rust
-  is used. Nightly is never forced.
-- `Swatinem/rust-cache` caches the Cargo registry and `project/target`,
-  keyed by dependency/toolchain hashes — the uploaded source itself is
-  never cached, so every build compiles your current code.
-
-## Security
-
-- Minimal workflow permissions (`contents: read`). Branch deletion uses
-  your local `gh` credentials, not workflow secrets.
-- No repository secrets are exposed to the build.
-- The archive excludes `.git/`, `target/`, `.github/`, `.env*`,
-  `*.pem`, `*.key`. Tokens are never printed or placed in arguments.
-- Treat the runner as untrusted build code: it only gets the uploaded
-  source, nothing else.
-
-## Requirements
-
-`bash`, `git`, `gh`, `tar`, `mktemp` on a normal Linux environment.
-Nothing is installed silently.
+See `remote-build-explained.html` (if present) for a clickable
+stage-by-stage diagram with success and failed log examples.

@@ -1,17 +1,30 @@
-name: Remote Rust Build
+name: Remote build
 
-# Triggered automatically when remote-build.sh pushes a temporary
-# branch named remote-build/<unique-id>. No manual dispatch needed.
-# Permanent branches (main/master/...) never trigger this workflow.
+# Temporary per-build branches only. Permanent branches never trigger.
 # ("on" is quoted: plain `on:` parses as boolean true in YAML 1.1.)
 "on":
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "Unique temporary build ID (branch name)"
+        required: true
+        type: string
+      build_command:
+        description: "Shell command run as: cd project && <command>"
+        required: false
+        default: "cargo build --release"
+        type: string
+      apt_packages:
+        description: "Extra apt packages, space separated"
+        required: false
+        default: ""
+        type: string
   push:
     branches:
       - "remote-build/**"
 
-# Minimal permissions: the workflow only reads the uploaded source,
-# builds it, and uploads a temporary artifact. It never pushes,
-# never deletes branches, never touches secrets.
+# Minimal permissions: read the uploaded source, build it, upload a
+# short-lived artifact. Never pushes, never deletes branches.
 permissions:
   contents: read
 
@@ -28,91 +41,134 @@ jobs:
 
       - name: Show build context
         run: |
-          echo "branch: ${{ github.ref_name }}"
-          echo "sha:    ${{ github.sha }}"
+          echo "event:      ${{ github.event_name }}"
+          echo "ref:        ${{ github.ref }}"
+          echo "ref_name:   ${{ github.ref_name }}"
+          echo "sha:        ${{ github.sha }}"
+          echo "input ID:   ${{ inputs.build_id }}"
+          echo "input cmd:  ${{ inputs.build_command }}"
           ls -la
           echo "--- project/ ---"
           ls -la project || echo "ERROR: project/ directory missing"
+          echo "--- metadata ---"
+          cat remote-build-command.txt 2>/dev/null || echo "(no remote-build-command.txt)"
+          cat remote-build-id.txt 2>/dev/null || echo "(no remote-build-id.txt)"
+          cat remote-build-apt.txt 2>/dev/null || echo "(no remote-build-apt.txt)"
 
-      - name: Read build command
-        id: cmd
+      - name: Resolve build ID and command
+        id: resolve
         run: |
-          if [ -f remote-build-command.txt ]; then
-            CMD="$(cat remote-build-command.txt)"
-          else
-            CMD="cargo build --release"
+          # Precedence: workflow_dispatch input > metadata file > default.
+          # This keeps both triggers working (push has no inputs).
+          BUILD_ID="${{ inputs.build_id }}"
+          if [ -z "$BUILD_ID" ] && [ -f remote-build-id.txt ]; then
+            BUILD_ID="$(cat remote-build-id.txt)"
           fi
-          # Guard against empty file.
+          if [ -z "$BUILD_ID" ]; then
+            BUILD_ID="${{ github.run_id }}"
+          fi
+          BUILD_ID="$(echo "$BUILD_ID" | tr -cd 'A-Za-z0-9_.-' | cut -c1-128)"
+          if [ -z "$BUILD_ID" ]; then
+            BUILD_ID="${{ github.run_id }}"
+          fi
+
+          CMD="${{ inputs.build_command }}"
+          if [ -z "$CMD" ] && [ -f remote-build-command.txt ]; then
+            CMD="$(cat remote-build-command.txt)"
+          fi
           if [ -z "$CMD" ]; then
             CMD="cargo build --release"
           fi
-          echo "Build command: $CMD"
-          # Persist for later steps via GITHUB_ENV (no secrets involved).
+
+          APT="${{ inputs.apt_packages }}"
+          if [ -f remote-build-apt.txt ] && grep -q '[^[:space:]]' remote-build-apt.txt 2>/dev/null; then
+            APT="$(cat remote-build-apt.txt)"
+          fi
+
+          echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+          echo "REMOTE_BUILD_ID=$BUILD_ID" >> "$GITHUB_ENV"
           echo "REMOTE_BUILD_COMMAND=$CMD" >> "$GITHUB_ENV"
+          echo "REMOTE_BUILD_APT=$APT" >> "$GITHUB_ENV"
+          echo "Resolved build_id: $BUILD_ID"
+          echo "Resolved command:  $CMD"
+          echo "Resolved apt:      ${APT:-<none>}"
 
       - name: Install system dependencies
         run: |
-          # The client may request apt packages (e.g. libmpv-dev for
-          # crates linking system libraries) via remote-build-apt.txt.
-          # (grep on the file directly, not a pipe: no SIGPIPE risk.
-          # -s is wrong here: the file always ends with a newline.)
-          if grep -q '[^[:space:]]' remote-build-apt.txt 2>/dev/null; then
-            echo "Installing system packages: $(cat remote-build-apt.txt)"
+          if [ -n "$REMOTE_BUILD_APT" ]; then
+            echo "Installing system packages: $REMOTE_BUILD_APT"
             sudo apt-get update -qq
-            sudo apt-get install -y $(cat remote-build-apt.txt)
+            # shellcheck disable=SC2086
+            sudo apt-get install -y $REMOTE_BUILD_APT
           else
             echo "No extra system packages requested."
           fi
 
+      - name: Detect languages
+        id: detect
+        run: |
+          RUST=false; GO=false; NODE=false
+          [ -f project/Cargo.toml ] && RUST=true
+          [ -f project/go.mod ] && GO=true
+          [ -f project/package.json ] && NODE=true
+          echo "rust=$RUST" >> "$GITHUB_OUTPUT"
+          echo "go=$GO" >> "$GITHUB_OUTPUT"
+          echo "node=$NODE" >> "$GITHUB_OUTPUT"
+          echo "rust=$RUST go=$GO node=$NODE"
+
       - name: Detect Rust toolchain
         id: toolchain
+        if: steps.detect.outputs.rust == 'true'
         run: |
-          # dtolnay/rust-toolchain requires an explicit `toolchain` input,
-          # so read the project's own config first, else fall back to stable.
-          # (Pure sed/bash here: no `| head`, which can SIGPIPE-fail the
-          # step since GitHub's default shell runs with `pipefail`.)
           TOOLCHAIN="stable"
           if [ -f project/rust-toolchain.toml ]; then
             CH="$(sed -n -E -e 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' -e "s/^[[:space:]]*channel[[:space:]]*=[[:space:]]*'([^']+)'.*/\1/p" project/rust-toolchain.toml 2>/dev/null || true)"
-            CH="${CH%%$'\n'*}"          # first match only
-            CH="${CH//[[:space:]]/}"     # strip whitespace
-            if [ -n "$CH" ]; then
-              TOOLCHAIN="$CH"
-            fi
-          elif [ -f project/rust-toolchain ]; then
-            CH="$(head -1 project/rust-toolchain 2>/dev/null || true)"
+            CH="${CH%%$'\n'*}"
             CH="${CH//[[:space:]]/}"
-            if [ -n "$CH" ]; then
-              TOOLCHAIN="$CH"
-            fi
+            if [ -n "$CH" ]; then TOOLCHAIN="$CH"; fi
+          elif [ -f project/rust-toolchain ]; then
+            CH="$(head -n 1 project/rust-toolchain 2>/dev/null || true)"
+            CH="${CH//[[:space:]]/}"
+            if [ -n "$CH" ]; then TOOLCHAIN="$CH"; fi
           fi
           echo "toolchain=$TOOLCHAIN" >> "$GITHUB_OUTPUT"
-          echo "Using toolchain: $TOOLCHAIN"
+          echo "Using Rust toolchain: $TOOLCHAIN"
 
       - name: Set up Rust toolchain
+        if: steps.detect.outputs.rust == 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.toolchain.outputs.toolchain }}
 
+      - name: Set up Go
+        if: steps.detect.outputs.go == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: project/go.mod
+          cache-dependency-path: project/go.sum
+
+      - name: Set up Node.js
+        if: steps.detect.outputs.node == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: project/package-lock.json
+
       - name: Show toolchain versions
         run: |
-          rustc --version || true
-          cargo --version || true
-          if [ -f project/rust-toolchain ] || [ -f project/rust-toolchain.toml ]; then
-            echo "Using project-provided toolchain config."
-            cat project/rust-toolchain 2>/dev/null || true
-            cat project/rust-toolchain.toml 2>/dev/null || true
-          else
-            echo "No rust-toolchain file found; using stable."
-          fi
+          rustc --version 2>/dev/null || echo "(no rustc)"
+          cargo --version 2>/dev/null || echo "(no cargo)"
+          go version 2>/dev/null || echo "(no go)"
+          node --version 2>/dev/null || echo "(no node)"
+          npm --version 2>/dev/null || true
+          if [ -f project/rust-toolchain.toml ]; then echo "--- rust-toolchain.toml ---"; cat project/rust-toolchain.toml; fi
+          if [ -f project/rust-toolchain ]; then echo "--- rust-toolchain ---"; cat project/rust-toolchain; fi
 
       - name: Cache Cargo dependencies
+        if: steps.detect.outputs.rust == 'true'
         uses: Swatinem/rust-cache@v2
         with:
-          # Cache the registry + target dir of the uploaded project.
-          # The cache key automatically includes Cargo.toml/Cargo.lock
-          # hashes and the toolchain version, so stale source is never
-          # reused: every build compiles the freshly uploaded project/.
           workspaces: |
             project -> project/target
 
@@ -122,18 +178,21 @@ jobs:
           echo "+ $REMOTE_BUILD_COMMAND"
           bash -c "$REMOTE_BUILD_COMMAND"
 
-      - name: Collect release binary
+      - name: Collect output binaries
         if: success()
         run: |
           mkdir -p dist
           if [ -d project/target/release ]; then
-            # Copy top-level executables (the actual binary). Skip
-            # intermediate artifacts (.d/.rlib/.rmeta/.so).
             while IFS= read -r -d '' f; do
               cp "$f" dist/ || true
             done < <(find project/target/release -maxdepth 1 -type f -executable \
               ! -name '*.d' ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' -print0)
           fi
+          for d in project/dist project/build project/out; do
+            if [ -d "$d" ]; then
+              cp -r "$d"/. dist/ || true
+            fi
+          done
           echo "dist/ contents:"
           ls -la dist || true
 
@@ -141,7 +200,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: remote-build-binary
+          name: remote-build-binary-${{ steps.resolve.outputs.build_id }}
           path: dist/
           if-no-files-found: warn
           retention-days: 1
@@ -149,6 +208,5 @@ jobs:
       - name: Clean temporary workspace
         if: always()
         run: |
-          # Runners are ephemeral, but tidy up explicitly anyway.
           rm -rf dist || true
           echo "Runner workspace cleaned."
