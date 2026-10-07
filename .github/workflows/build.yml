@@ -214,13 +214,16 @@ jobs:
           # that project's cache.
           # NOTE on temp branches: GitHub only lets a run read caches
           # from its own branch or the default branch, never from sibling
-          # temp branches. So a rebuild reuses a cache entry only if it
-          # is reachable from main (or its own branch); every project's
-          # first build is cold, and orphaned temp-branch entries are
-          # evicted by GitHub's cache quota. For warm-every-time Rust
-          # builds across temp branches, the follow-up is sccache with
-          # external (S3/R2) storage instead of actions/cache.
+          # temp branches -- and each build uses a fresh branch, so a
+          # restore can only ever hit entries reachable from main. Saving
+          # is therefore disabled (save-if: false): it would only write
+          # ~64 MB orphans scoped to deleted branches on every build.
+          # Restore stays enabled (free if main ever holds entries).
+          # For warm-every-time Rust builds across temp branches, the
+          # follow-up is sccache with external (S3/R2) storage instead
+          # of actions/cache.
           shared-key: ${{ steps.fingerprint.outputs.slug }}
+          save-if: false
           workspaces: |
             project -> project/target
 
