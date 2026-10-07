@@ -1,0 +1,116 @@
+name: Remote Rust Build
+
+# Triggered automatically when remote-build.sh pushes a temporary
+# branch named remote-build/<unique-id>. No manual dispatch needed.
+# Permanent branches (main/master/...) never trigger this workflow.
+# ("on" is quoted: plain `on:` parses as boolean true in YAML 1.1.)
+"on":
+  push:
+    branches:
+      - "remote-build/**"
+
+# Minimal permissions: the workflow only reads the uploaded source,
+# builds it, and uploads a temporary artifact. It never pushes,
+# never deletes branches, never touches secrets.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out temporary build branch
+        uses: actions/checkout@v4
+
+      - name: Show build context
+        run: |
+          echo "branch: ${{ github.ref_name }}"
+          echo "sha:    ${{ github.sha }}"
+          ls -la
+          echo "--- project/ ---"
+          ls -la project || echo "ERROR: project/ directory missing"
+
+      - name: Read build command
+        id: cmd
+        run: |
+          if [ -f remote-build-command.txt ]; then
+            CMD="$(cat remote-build-command.txt)"
+          else
+            CMD="cargo build --release"
+          fi
+          # Guard against empty file.
+          if [ -z "$CMD" ]; then
+            CMD="cargo build --release"
+          fi
+          echo "Build command: $CMD"
+          # Persist for later steps via GITHUB_ENV (no secrets involved).
+          echo "REMOTE_BUILD_COMMAND=$CMD" >> "$GITHUB_ENV"
+
+      - name: Set up Rust toolchain
+        # With no explicit toolchain input this action respects
+        # rust-toolchain / rust-toolchain.toml inside project/
+        # and falls back to stable Rust otherwise.
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version || true
+          cargo --version || true
+          if [ -f project/rust-toolchain ] || [ -f project/rust-toolchain.toml ]; then
+            echo "Using project-provided toolchain config."
+            cat project/rust-toolchain 2>/dev/null || true
+            cat project/rust-toolchain.toml 2>/dev/null || true
+          else
+            echo "No rust-toolchain file found; using stable."
+          fi
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Cache the registry + target dir of the uploaded project.
+          # The cache key automatically includes Cargo.toml/Cargo.lock
+          # hashes and the toolchain version, so stale source is never
+          # reused: every build compiles the freshly uploaded project/.
+          workspaces: |
+            project -> project/target
+
+      - name: Build uploaded project
+        run: |
+          cd project
+          echo "+ $REMOTE_BUILD_COMMAND"
+          bash -c "$REMOTE_BUILD_COMMAND"
+
+      - name: Collect release binary
+        if: success()
+        run: |
+          mkdir -p dist
+          if [ -d project/target/release ]; then
+            # Copy top-level executables (the actual binary). Skip
+            # intermediate artifacts (.d/.rlib/.rmeta/.so).
+            while IFS= read -r -d '' f; do
+              cp "$f" dist/ || true
+            done < <(find project/target/release -maxdepth 1 -type f -executable \
+              ! -name '*.d' ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' -print0)
+          fi
+          echo "dist/ contents:"
+          ls -la dist || true
+
+      - name: Upload binary artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-build-binary
+          path: dist/
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Clean temporary workspace
+        if: always()
+        run: |
+          # Runners are ephemeral, but tidy up explicitly anyway.
+          rm -rf dist || true
+          echo "Runner workspace cleaned."
