@@ -109,8 +109,9 @@ success, so there is nothing to pull; fix the logged error and re-run.
    `gh workflow run build.yml --ref <branch> -f build_id=... -f build_command=...`
    (dispatch-only: exactly one run per build).
 5. **Find + wait.** Polls `gh run list --branch <branch>` — the branch
-   is unique, so concurrent builds never mix — then
-   `gh run watch --exit-status`.
+   is unique, so concurrent builds never mix — then polls the run
+   status (`queued` → `in_progress` → `completed`, with heartbeat
+   lines) instead of a blind wait.
 6. **Logs.** Prints `gh run view --log` (normal Cargo / go / npm output).
 7. **Download.** On success `gh run download -n remote-build-binary-<id>`.
 8. **Cleanup (always).** `gh run delete <id>` (removes artifact + logs),

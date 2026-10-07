@@ -637,6 +637,52 @@ def wait_for_binary_artifact(repo, run_id, artifact, timeout_s=300):
     return fallback or last
 
 
+def poll_run_to_completion(repo, run_id, run_url, timeout_mins=45):
+    """Wait for a run, showing its REAL phase instead of a blind spinner.
+
+    Polls the run status every 15s (queued -> in_progress -> completed),
+    re-labels the live ticker on phase changes, and prints a full
+    heartbeat line every 60s so even scrollback-only terminals prove
+    the client is alive. Returns the conclusion ("" on timeout).
+    """
+    deadline = time.time() + timeout_mins * 60
+    started = time.time()
+    phase = ""
+    last_beat = 0.0
+    pulse_start("waiting for runner")
+    try:
+        while time.time() < deadline:
+            try:
+                r = gh("api",
+                       f"repos/{repo}/actions/runs/{run_id}",
+                       "--jq", "\\(.status) \\(.conclusion)",
+                       timeout=60)
+                status, concl = (r.stdout.split() + ["", ""])[:2]
+            except RuntimeError:
+                status, concl = "", ""
+            if status and status != phase:
+                phase = status
+                label = ("queued on GitHub-hosted runner"
+                         if phase == "queued"
+                         else "building on GitHub Actions"
+                         if phase == "in_progress"
+                         else f"run {phase}")
+                pulse_stop()
+                pulse_start(label)
+            now = time.time()
+            if now - last_beat >= 60:
+                last_beat = now
+                el = int(now - started)
+                say(f"still waiting... phase={phase or '?'} "
+                    f"elapsed={el // 60}m{el % 60:02d}s ({run_url})")
+            if status == "completed":
+                return concl or ""
+            time.sleep(15)
+    finally:
+        pulse_stop()
+    return ""
+
+
 def list_branch_runs(repo, branch, limit=10, workflow=WORKFLOW_FILE):
     """All run IDs on a branch (dispatch + push siblings). Never raises."""
     try:
@@ -1071,16 +1117,14 @@ def main(argv=None):
         state.run_id = run_id
         say(f"run: https://github.com/{repo}/actions/runs/{run_id}")
 
-        # 12-13. Wait, then print real compiler/build output.
-        log(f"waiting up to {args.timeout_mins} min "
-            f"(gh run watch)... Ctrl+C cancels.")
-        pulse_start("building on GitHub Actions")
-        try:
-            watch = gh("run", "watch", run_id, "--repo", repo,
-                       "--exit-status", "--interval", "10",
-                       check=False, timeout=args.timeout_mins * 60 + 60)
-        finally:
-            pulse_stop()
+        # 12-13. Wait (showing the real run phase, not a blind spinner),
+        # then print the compiler/build output.
+        run_url = f"https://github.com/{repo}/actions/runs/{run_id}"
+        concl = poll_run_to_completion(repo, run_id, run_url,
+                                       timeout_mins=args.timeout_mins)
+        if not concl:
+            err("timed out waiting for the remote build.")
+            return 1
         viewed = gh("run", "view", run_id, "--repo", repo,
                     "--log", check=False, timeout=600)
         cleaned = clean_log(viewed.stdout)
@@ -1095,20 +1139,11 @@ def main(argv=None):
         if viewed.stderr:
             print(viewed.stderr, end="", file=sys.stderr)
 
-        concl = ""
-        try:
-            concl = gh("run", "view", run_id, "--repo", repo,
-                       "--json", "conclusion",
-                       "--jq", ".conclusion").stdout.strip()
-        except RuntimeError:
-            pass
-        success = (watch.returncode == 0 and concl in ("", "success")) \
-            or concl == "success"
+        success = concl == "success"
         if interrupted["flag"]:
             return 130
         if not success:
-            err(f"remote build failed "
-                f"(conclusion={concl or 'failure'}). "
+            err(f"remote build failed (conclusion={concl}). "
                 f"No binary was downloaded: the workflow uploads the "
                 f"artifact only on success, so there is nothing to pull. "
                 f"Cleanup below still deletes the run and branch.")
