@@ -28,6 +28,11 @@ name: Remote build
         required: false
         default: ""
         type: string
+      apt_hash:
+        description: "12-hex fingerprint of the apt package list"
+        required: false
+        default: ""
+        type: string
       cache_slug:
         description: "Stable per-project cache namespace (e.g. rust-mu)"
         required: false
@@ -161,13 +166,54 @@ jobs:
           echo "Cache key:    $CACHE_KEY"
           echo "Cache prefix: $CACHE_PREFIX"
 
+          # Apt cache key: shared across PROJECTS using the same package
+          # list (unlike the project cache). Empty when no apt packages
+          # requested -- then no apt caching happens at all.
+          APT_KEY=""
+          if [ -n "$APT" ]; then
+            APTHASH="${{ inputs.apt_hash }}"
+            if [ -z "$APTHASH" ]; then
+              APTHASH="$(printf '%s' "$APT" | sha256sum | cut -c1-12)"
+            fi
+            APT_KEY="remote-build-apt-${APTHASH}"
+          fi
+          echo "apt_key=$APT_KEY" >> "$GITHUB_OUTPUT"
+          echo "REMOTE_BUILD_APT_KEY=$APT_KEY" >> "$GITHUB_ENV"
+          echo "Apt cache key: ${APT_KEY:-<none>}"
+
+      - name: Prepare apt cache directory
+        if: steps.resolve.outputs.apt_key != ''
+        run: mkdir -p apt-cache
+
+      - name: Restore apt package cache
+        if: steps.resolve.outputs.apt_key != ''
+        uses: actions/cache/restore@v4
+        with:
+          # .deb files + package lists, seeded to main scope by the
+          # seed-cache run. Hit => install from local debs with NO
+          # apt-get update and NO downloads (the 1m53s step drops to
+          # seconds of dpkg configure).
+          path: apt-cache
+          key: ${{ steps.resolve.outputs.apt_key }}
+          fail-on-cache-miss: false
+
       - name: Install system dependencies
         run: |
           if [ -n "$REMOTE_BUILD_APT" ]; then
-            echo "Installing system packages: $REMOTE_BUILD_APT"
-            sudo apt-get update -qq
-            # shellcheck disable=SC2086
-            sudo apt-get install -y $REMOTE_BUILD_APT
+            if [ -f apt-cache/marker.txt ] && [ "$(cat apt-cache/marker.txt)" = "$REMOTE_BUILD_APT" ] \
+               && ls apt-cache/archives/*.deb >/dev/null 2>&1; then
+              echo "Apt cache hit: installing from cached .debs (no update, no downloads)."
+              sudo cp apt-cache/lists/* /var/lib/apt/lists/ 2>/dev/null || true
+              sudo cp apt-cache/archives/*.deb /var/cache/apt/archives/ 2>/dev/null || true
+              # shellcheck disable=SC2086
+              sudo apt-get install -y $REMOTE_BUILD_APT
+            else
+              echo "Apt cache miss: updating package lists and downloading."
+              echo "(this is the slow path, ~2 min, only until seeded)"
+              sudo apt-get update -qq
+              # shellcheck disable=SC2086
+              sudo apt-get install -y $REMOTE_BUILD_APT
+            fi
           else
             echo "No extra system packages requested."
           fi
@@ -240,7 +286,7 @@ jobs:
         run: |
           # actions/cache errors when none of its paths exist; a cold
           # worker with a fresh checkout has none of these yet.
-          mkdir -p project/target ~/.cargo/registry ~/.cargo/git \
+          mkdir -p project/target apt-cache ~/.cargo/registry ~/.cargo/git \
             ~/go/pkg/mod ~/.cache/go-build ~/.npm
 
       - name: Restore shared cache (main scope)
@@ -319,6 +365,18 @@ jobs:
           )
           if [ -d project/target ]; then
             tar -czf cache-out/ws-cache.tar.gz -C "$GITHUB_WORKSPACE" project/target || true
+          fi
+          # Apt .debs + package lists + the exact package string that
+          # produced them (marker guards against list mismatches).
+          if [ -n "$REMOTE_BUILD_APT" ]; then
+            mkdir -p apt-stage/lists apt-stage/archives
+            sudo cp /var/lib/apt/lists/* apt-stage/lists/ 2>/dev/null || true
+            sudo cp /var/cache/apt/archives/*.deb apt-stage/archives/ 2>/dev/null || true
+            printf '%s' "$REMOTE_BUILD_APT" > apt-stage/marker.txt
+            if ls apt-stage/archives/*.deb >/dev/null 2>&1; then
+              tar -czf cache-out/apt-cache.tar.gz -C apt-stage lists archives marker.txt || true
+            fi
+            rm -rf apt-stage
           fi
           ls -la cache-out/ || true
           TOTAL="$(du -sb cache-out 2>/dev/null | cut -f1)"

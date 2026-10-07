@@ -125,7 +125,11 @@ the shared cache (read-only — temp branches can only read main-scope
 entries), auto-detects Rust (`Cargo.toml`, respects
 `rust-toolchain.toml`) / Go (`go.mod`) / Node (`package.json`), runs
 your command, uploads `remote-build-binary-<build_id>` plus a
-`cache-payload-<slug>` (both `retention-days: 1`). After success the
+`cache-payload-<slug>` (both `retention-days: 1`). Apt packages get
+their own shared entry (`remote-build-apt-<hash>`, one per package
+list across all projects): the `.deb` files and package lists are
+cached too, so repeat installs skip `apt-get update` and all downloads.
+After success the
 client dispatches `seed-cache.yml` on `main`, which saves the payload
 to main-scope cache so the next build of the same project is warm
 (`--no-seed` skips this).

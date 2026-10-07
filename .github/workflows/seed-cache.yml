@@ -29,6 +29,11 @@ run-name: Seed ${{ inputs.slug }} from run ${{ inputs.payload_run_id }}
         description: "Exact cache key to save"
         required: true
         type: string
+      apt_key:
+        description: "Exact apt cache key (empty when no apt packages)"
+        required: false
+        default: ""
+        type: string
 
 # contents:read is unused here (no checkout) but explicit; actions:write
 # is required for actions/cache/save.
@@ -57,15 +62,18 @@ jobs:
 
       - name: Restore payload trees
         run: |
-          mkdir -p ~/.cargo ~/go project
+          mkdir -p ~/.cargo ~/go project apt-cache
           if [ -f payload/home-cache.tar.gz ]; then
             tar -xzf payload/home-cache.tar.gz -C "$HOME"
           fi
           if [ -f payload/ws-cache.tar.gz ]; then
             tar -xzf payload/ws-cache.tar.gz -C "$GITHUB_WORKSPACE"
           fi
+          if [ -f payload/apt-cache.tar.gz ]; then
+            tar -xzf payload/apt-cache.tar.gz -C apt-cache
+          fi
           echo "Restored sizes:"
-          du -sh ~/.cargo ~/go project 2>/dev/null || true
+          du -sh ~/.cargo ~/go project apt-cache 2>/dev/null || true
           if [ -z "$(ls -A ~/.cargo project 2>/dev/null)" ]; then
             echo "ERROR: payload extracted nothing usable." >&2
             exit 1
@@ -82,3 +90,13 @@ jobs:
             ~/.npm
             project/target
           key: ${{ inputs.cache_key }}
+
+      - name: Save apt cache (main scope)
+        if: inputs.apt_key != ''
+        uses: actions/cache/save@v4
+        with:
+          # Shared across PROJECTS with the same package list; the key
+          # covers only the apt string, so libmpv-dev seeded once serves
+          # every project that requests it.
+          path: apt-cache
+          key: ${{ inputs.apt_key }}

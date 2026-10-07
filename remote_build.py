@@ -668,7 +668,7 @@ def find_run(repo, branch, since_epoch, timeout_s=120,
                        f"Actions tab).")
 
 
-def seed_shared_cache(repo, run_id, slug, cache_key, state,
+def seed_shared_cache(repo, run_id, slug, cache_key, apt_key, state,
                       no_seed=False, timeout_mins=15):
     """Save this build's dependencies to main-scope cache for the next
     build of the same project.
@@ -704,7 +704,8 @@ def seed_shared_cache(repo, run_id, slug, cache_key, state,
               "--repo", repo,
               "-f", f"slug={slug}",
               "-f", f"payload_run_id={run_id}",
-              "-f", f"cache_key={cache_key}", check=False)
+              "-f", f"cache_key={cache_key}",
+              "-f", f"apt_key={apt_key}", check=False)
     if trig.returncode != 0:
         log("WARNING: seed-cache dispatch failed; next build stays cold.")
         return False
@@ -828,6 +829,9 @@ def main(argv=None):
     artifact = f"{ARTIFACT_PREFIX}-{build_id}"
     slug, lock16, cmd12, cache_key, cache_prefix = cache_key_for(
         project_root, args.command)
+    apt_hash = (hashlib.sha256(args.apt.encode()).hexdigest()[:12]
+                if args.apt.strip() else "")
+    apt_key = f"remote-build-apt-{apt_hash}" if apt_hash else ""
     log(f"build ID: {build_id}")
     log(f"branch:   {branch}")
     log(f"command:  {args.command}")
@@ -932,7 +936,8 @@ def main(argv=None):
                   "-f", f"apt_packages={args.apt}",
                   "-f", f"cache_slug={slug}",
                   "-f", f"cache_lock={lock16}",
-                  "-f", f"cache_cmd={cmd12}", check=False)
+                  "-f", f"cache_cmd={cmd12}",
+                  "-f", f"apt_hash={apt_hash}", check=False)
         if trig.returncode != 0:
             raise RuntimeError(
                 "workflow_dispatch failed (build.yml is dispatch-only; "
@@ -1032,7 +1037,7 @@ def main(argv=None):
             return 1
         for f in files:
             say(f"binary: {f} ({f.stat().st_size} bytes)")
-        seed_shared_cache(repo, run_id, slug, cache_key, state,
+        seed_shared_cache(repo, run_id, slug, cache_key, apt_key, state,
                           no_seed=args.no_seed)
         say("remote build SUCCEEDED.")
         return 0
