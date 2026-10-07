@@ -50,11 +50,35 @@ jobs:
           # Persist for later steps via GITHUB_ENV (no secrets involved).
           echo "REMOTE_BUILD_COMMAND=$CMD" >> "$GITHUB_ENV"
 
+      - name: Detect Rust toolchain
+        id: toolchain
+        run: |
+          # dtolnay/rust-toolchain requires an explicit `toolchain` input,
+          # so read the project's own config first, else fall back to stable.
+          # (Pure sed/bash here: no `| head`, which can SIGPIPE-fail the
+          # step since GitHub's default shell runs with `pipefail`.)
+          TOOLCHAIN="stable"
+          if [ -f project/rust-toolchain.toml ]; then
+            CH="$(sed -n -E -e 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' -e "s/^[[:space:]]*channel[[:space:]]*=[[:space:]]*'([^']+)'.*/\1/p" project/rust-toolchain.toml 2>/dev/null || true)"
+            CH="${CH%%$'\n'*}"          # first match only
+            CH="${CH//[[:space:]]/}"     # strip whitespace
+            if [ -n "$CH" ]; then
+              TOOLCHAIN="$CH"
+            fi
+          elif [ -f project/rust-toolchain ]; then
+            CH="$(head -1 project/rust-toolchain 2>/dev/null || true)"
+            CH="${CH//[[:space:]]/}"
+            if [ -n "$CH" ]; then
+              TOOLCHAIN="$CH"
+            fi
+          fi
+          echo "toolchain=$TOOLCHAIN" >> "$GITHUB_OUTPUT"
+          echo "Using toolchain: $TOOLCHAIN"
+
       - name: Set up Rust toolchain
-        # With no explicit toolchain input this action respects
-        # rust-toolchain / rust-toolchain.toml inside project/
-        # and falls back to stable Rust otherwise.
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.toolchain }}
 
       - name: Show toolchain versions
         run: |
