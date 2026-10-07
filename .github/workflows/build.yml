@@ -50,6 +50,20 @@ jobs:
           # Persist for later steps via GITHUB_ENV (no secrets involved).
           echo "REMOTE_BUILD_COMMAND=$CMD" >> "$GITHUB_ENV"
 
+      - name: Install system dependencies
+        run: |
+          # The client may request apt packages (e.g. libmpv-dev for
+          # crates linking system libraries) via remote-build-apt.txt.
+          # (grep on the file directly, not a pipe: no SIGPIPE risk.
+          # -s is wrong here: the file always ends with a newline.)
+          if grep -q '[^[:space:]]' remote-build-apt.txt 2>/dev/null; then
+            echo "Installing system packages: $(cat remote-build-apt.txt)"
+            sudo apt-get update -qq
+            sudo apt-get install -y $(cat remote-build-apt.txt)
+          else
+            echo "No extra system packages requested."
+          fi
+
       - name: Detect Rust toolchain
         id: toolchain
         run: |

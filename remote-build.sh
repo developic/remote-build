@@ -12,6 +12,8 @@
 #   REMOTE_BUILD_WORKFLOW         workflow file name, default: build.yml
 #   REMOTE_BUILD_TIMEOUT          seconds to wait, default: 1800
 #   REMOTE_BUILD_COMMAND          remote cargo command, default: cargo build --release
+#   REMOTE_BUILD_APT_PACKAGES       extra apt packages for the runner, default: (none)
+#                                   example: REMOTE_BUILD_APT_PACKAGES="libmpv-dev"
 #   REMOTE_BUILD_DOWNLOAD_BINARY  1 to download the binary artifact, 0 to skip (default: 1)
 #   REMOTE_BUILD_OUTPUT_DIR       download directory, default: remote-build-output
 #
@@ -27,6 +29,9 @@ REMOTE_BUILD_TIMEOUT="${REMOTE_BUILD_TIMEOUT:-1800}"
 REMOTE_BUILD_COMMAND="${REMOTE_BUILD_COMMAND:-cargo build --release}"
 REMOTE_BUILD_DOWNLOAD_BINARY="${REMOTE_BUILD_DOWNLOAD_BINARY:-1}"
 REMOTE_BUILD_OUTPUT_DIR="${REMOTE_BUILD_OUTPUT_DIR:-remote-build-output}"
+# Space-separated apt packages installed on the runner before building.
+# Needed when your crate links a system library (e.g. libmpv for mpv-rs).
+REMOTE_BUILD_APT_PACKAGES="${REMOTE_BUILD_APT_PACKAGES:-}"
 
 # ------------------------------------------------------------------ utilities
 
@@ -42,6 +47,22 @@ step() {
 
 info() {
     echo "  $*"
+}
+
+# Print "<status> <conclusion>" for the current run, or nothing on error.
+# Uses the REST API directly: `gh run view --json` field names have
+# changed across gh versions, while .status/.conclusion from
+# repos/{repo}/actions/runs/{id} have been stable forever.
+# On failure the gh error is saved to $STATUS_ERR_FILE for diagnosis.
+run_status() {
+    gh api "repos/${REMOTE_BUILD_REPO}/actions/runs/${RUN_ID}" \
+        --jq '"\(.status) \(.conclusion)"' 2>"$STATUS_ERR_FILE" || true
+}
+
+# Print just the run status (for the cleanup cancel check).
+run_state() {
+    gh api "repos/${REMOTE_BUILD_REPO}/actions/runs/${RUN_ID}" \
+        --jq '.status' 2>/dev/null || true
 }
 
 # ------------------------------------------------------------------ state
@@ -75,8 +96,7 @@ cleanup() {
     # If the run is still in flight (timeout / Ctrl+C), try to cancel it.
     if [ -n "$RUN_ID" ] && [ -n "$REMOTE_BUILD_REPO" ]; then
         local state
-        state="$(gh run view "$RUN_ID" --repo "$REMOTE_BUILD_REPO" \
-            --json status --jq '.status' 2>/dev/null || true)"
+        state="$(run_state)"
         if [ "$state" = "queued" ] || [ "$state" = "in_progress" ] \
             || [ "$state" = "requested" ] || [ "$state" = "waiting" ]; then
             echo ""
@@ -147,6 +167,9 @@ echo ""
 echo "Project:    $PROJECT_NAME"
 echo "Repository: $REMOTE_BUILD_REPO"
 echo "Command:    $REMOTE_BUILD_COMMAND"
+if [ -n "$REMOTE_BUILD_APT_PACKAGES" ]; then
+    echo "Apt:        $REMOTE_BUILD_APT_PACKAGES"
+fi
 echo ""
 
 # Unique ID per build so concurrent runs never share a branch.
@@ -161,6 +184,7 @@ step "1/6" "Packing project..."
 
 TMPDIR_PATH="$(mktemp -d)"
 CLONE_DIR="${TMPDIR_PATH}/build-repo"
+STATUS_ERR_FILE="${TMPDIR_PATH}/gh-status-err.txt"
 ARCHIVE="${TMPDIR_PATH}/project.tar.gz"
 
 # NOTE: .cargo/ and rust-toolchain* are intentionally INCLUDED (needed
@@ -198,8 +222,10 @@ git -C "$CLONE_DIR" checkout --quiet -b "$BRANCH" \
 mkdir -p "${CLONE_DIR}/project"
 tar -xzf "$ARCHIVE" -C "${CLONE_DIR}/project"
 
-# Tell the workflow which cargo command to run.
+# Tell the workflow which cargo command to run and which
+# system packages to install (empty file = none needed).
 printf '%s\n' "$REMOTE_BUILD_COMMAND" > "${CLONE_DIR}/remote-build-command.txt"
+printf '%s\n' "$REMOTE_BUILD_APT_PACKAGES" > "${CLONE_DIR}/remote-build-apt.txt"
 
 git -C "$CLONE_DIR" add -A
 git -C "$CLONE_DIR" -c user.name="remote-build" -c user.email="remote-build@noreply" \
@@ -246,14 +272,21 @@ while true; do
         BUILD_FAILED=1
         die "Timeout after ${REMOTE_BUILD_TIMEOUT}s. Cancelling run... (${RUN_URL:-$RUN_ID})"
     fi
-    SUMMARY="$(gh run view "$RUN_ID" --repo "$REMOTE_BUILD_REPO" \
-        --json status,conclusion --jq '\(.status) \(.conclusion)' 2>/dev/null || true)"
+    SUMMARY="$(run_status)"
     STATUS="${SUMMARY%% *}"
     CONCLUSION="${SUMMARY##* }"
     if [ "$STATUS" = "completed" ]; then
         break
     fi
     if [ -z "$STATUS" ]; then
+        # Show the underlying gh error once so a broken query
+        # never silently retries until timeout.
+        if [ ! -f "${TMPDIR_PATH}/status-warned" ]; then
+            touch "${TMPDIR_PATH}/status-warned"
+            info "Could not read run status. gh said:"
+            sed 's/^/    /' "$STATUS_ERR_FILE" 2>/dev/null || true
+            info "Check manually: ${RUN_URL:-$RUN_ID}"
+        fi
         info "(status unavailable, retrying...)"
     else
         info "(status: $STATUS, elapsed: $((NOW_TS - START_TS))s)"

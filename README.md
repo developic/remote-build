@@ -78,6 +78,7 @@ Optional variables (with defaults):
 REMOTE_BUILD_WORKFLOW="build.yml"          # workflow file to watch
 REMOTE_BUILD_TIMEOUT=1800                  # seconds before giving up
 REMOTE_BUILD_COMMAND="cargo build --release"
+REMOTE_BUILD_APT_PACKAGES=""               # extra apt packages for the runner
 REMOTE_BUILD_DOWNLOAD_BINARY=1             # 1 = fetch binary, 0 = skip
 REMOTE_BUILD_OUTPUT_DIR="remote-build-output"
 ```
@@ -158,6 +159,20 @@ REMOTE_BUILD_COMMAND="cargo check" ./remote-build.sh
 REMOTE_BUILD_COMMAND="cargo build --release" ./remote-build.sh
 REMOTE_BUILD_COMMAND="cargo test --release" ./remote-build.sh
 ```
+
+## System libraries (apt packages)
+
+If your crate links a system C library (e.g. `mpv` via `libmpv-sys`,
+failing with `rust-lld: error: unable to find library -lmpv`), the
+default runner won't have it. Request it with:
+
+```bash
+REMOTE_BUILD_APT_PACKAGES="libmpv-dev" ./remote-build.sh
+```
+
+Multiple packages: `REMOTE_BUILD_APT_PACKAGES="libmpv-dev pkg-config"`.
+The workflow runs `sudo apt-get install -y` with your list before
+building; empty (the default) skips the step.
 
 The command runs from the uploaded project's root (`project/` in the
 runner). Any failure (non-zero cargo exit, workflow failure) makes the
