@@ -1,0 +1,15 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts (never commit binaries/zips)
+*.zip
+*.tar.gz
+remote-build-output/
+dist/
+
+# Local secrets / env
+.env
+*.key
+*.pem

@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 DEFAULT_COMMAND = "cargo build --release"
+DEFAULT_REPO = "developic/remote-build"
 WORKFLOW_FILE = "build.yml"
 ARTIFACT_PREFIX = "remote-build-binary"
 PROTECTED_BRANCHES = {"main", "master", "HEAD"}
@@ -50,52 +51,126 @@ CREDENTIAL_PATTERNS = ("*.key", "*.pem", "*.p12", "*.pfx", "*.asc",
 _QUIET = False  # quiet by default: live one-line progress, errors only.
 _PULSE_STOP = threading.Event()
 _PULSE_THREAD = None
+_SPIN_I = 0
+_SPINNER = "|/-\\"
+
+# ANSI styling for the live display (tty only, stdlib-only, no deps).
+_C = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "cyan": "\033[36m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "red": "\033[31m",
+}
+
+
+def _use_style():
+    return (sys.stdout.isatty()
+            and os.environ.get("NO_COLOR", "") == "")
+
+
+def _live():
+    """True when the one-line live animation should render (a real TTY).
+    Piped/CI output falls back to plain lines so logs stay readable."""
+    return _QUIET and sys.stdout.isatty()
+
+
+def _term_width():
+    try:
+        return max(40, shutil.get_terminal_width().columns - 1)
+    except Exception:
+        return 100
+
+
+def _write_live(text):
+    """Rewrite the single live status line cleanly.
+
+    Uses erase-to-end-of-line on styled terminals (no trailing-space
+    residue, no wrap on narrow screens); space-padding fallback otherwise.
+    """
+    width = _term_width()
+    text = text[:width]
+    if _use_style():
+        sys.stdout.write("\r\033[K" + text)
+    else:
+        sys.stdout.write("\r" + text.ljust(width)[:width])
+    sys.stdout.flush()
 
 
 def _clear_line():
-    sys.stdout.write("\r" + " " * 100 + "\r")
-    sys.stdout.flush()
+    if sys.stdout.isatty():
+        if _use_style():
+            sys.stdout.write("\r\033[K")
+        else:
+            sys.stdout.write("\r" + " " * _term_width() + "\r")
+        sys.stdout.flush()
+
+
+def _spin_frame():
+    global _SPIN_I
+    _SPIN_I += 1
+    return _SPINNER[_SPIN_I % len(_SPINNER)]
 
 
 def log(msg):
     """Progress info: full lines in verbose mode, live one-liner when quiet."""
-    if _QUIET:
-        sys.stdout.write("\r\u23f3 " + str(msg)[:96].ljust(96))
-        sys.stdout.flush()
+    if _live():
+        text = str(msg)[:100]
+        if _use_style():
+            _write_live(f"{_C['cyan']}{_spin_frame()}{_C['reset']} "
+                        f"{_C['dim']}{text}{_C['reset']}")
+        else:
+            _write_live(f"* {text}")
     else:
         print(f"[remote-build] {msg}", flush=True)
 
 
 def say(msg):
     """Always print a full line (clears the live progress line first)."""
-    if _QUIET:
+    if _live():
         _clear_line()
-    print(f"[remote-build] {msg}", flush=True)
+    text = f"[remote-build] {msg}"
+    if _use_style():
+        if "SUCCEEDED" in msg:
+            text = f"{_C['bold']}{_C['green']}[OK] {text}{_C['reset']}"
+        elif msg.startswith("run: https://"):
+            text = f"{_C['cyan']}{text}{_C['reset']}"
+    print(text, flush=True)
 
 
 def err(msg):
-    if _QUIET:
+    if _live():
         _clear_line()
-    print(f"[remote-build] ERROR: {msg}", file=sys.stderr, flush=True)
+    text = f"[remote-build] ERROR: {msg}"
+    if _use_style() or (sys.stderr.isatty()
+                        and os.environ.get("NO_COLOR", "") == ""):
+        text = f"{_C['bold']}{_C['red']}[FAIL] {text}{_C['reset']}"
+    print(text, file=sys.stderr, flush=True)
 
 
 def pulse_start(label):
     """Live elapsed-time ticker on one line while a long step blocks."""
     global _PULSE_THREAD
-    if not _QUIET:
+    if not _live():
         return
     _PULSE_STOP.clear()
 
     def tick():
         start = time.time()
-        frames = "\u280b\u2819\u2839\u2838\u283c\u283e\u2840\u2847\u284d\u284e"
         i = 0
-        while not _PULSE_STOP.wait(0.25):
+        while not _PULSE_STOP.wait(1.0):
             el = int(time.time() - start)
-            sys.stdout.write(
-                f"\r{frames[i % len(frames)]} {label} "
-                f"({el // 60}m{el % 60:02d}s)")
-            sys.stdout.flush()
+            dots = "." * (1 + i % 3)
+            if _use_style():
+                _write_live(f"{_C['cyan']}{_SPINNER[i % len(_SPINNER)]}"
+                            f"{_C['reset']} {label}{dots.ljust(3)} "
+                            f"{_C['yellow']}({el // 60}m{el % 60:02d}s)"
+                            f"{_C['reset']}")
+            else:
+                _write_live(f"{_SPINNER[i % len(_SPINNER)]} {label} "
+                            f"({el // 60}m{el % 60:02d}s)")
             i += 1
 
     _PULSE_THREAD = threading.Thread(target=tick, daemon=True)
@@ -108,7 +183,7 @@ def pulse_stop():
         _PULSE_STOP.set()
         _PULSE_THREAD.join(timeout=2)
         _PULSE_THREAD = None
-    if _QUIET:
+    if _live():
         _clear_line()
 
 
@@ -252,7 +327,7 @@ def check_staged_project(proj, command):
     entries = [p for p in proj.iterdir()]
     if not entries:
         raise RuntimeError(
-            "staged project/ is empty — nothing would be built. "
+            "staged project/ is empty -- nothing would be built. "
             "Are you running from the project root?")
     for prefix, manifest in COMMAND_MANIFESTS:
         if command.strip().startswith(prefix):
@@ -394,7 +469,7 @@ def parse_repo(repo):
 
 def generate_build_id():
     """Unique per-build suffix. The temp branch is remote-build/<suffix>
-    so it matches the workflow's `remote-build/**` trigger glob; the
+    (one run per branch, triggered via workflow_dispatch); the
     build ID (no slash, safe for artifact names) is remote-build-<suffix>.
     Returns (build_id, branch)."""
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -523,8 +598,10 @@ def main(argv=None):
         "REMOTE_BUILD_COMMAND", DEFAULT_COMMAND),
         help=f"build command run as 'cd project && <cmd>' "
              f"(default: {DEFAULT_COMMAND!r})")
-    ap.add_argument("--repo", default=os.environ.get("REMOTE_BUILD_REPO", ""),
-                    help="build repo OWNER/REPO (or $REMOTE_BUILD_REPO)")
+    ap.add_argument("--repo", default=os.environ.get("REMOTE_BUILD_REPO",
+                                                     DEFAULT_REPO),
+                    help=f"build repo OWNER/REPO (or $REMOTE_BUILD_REPO; "
+                         f"default: {DEFAULT_REPO})")
     ap.add_argument("--apt", default=os.environ.get(
         "REMOTE_BUILD_APT_PACKAGES", ""),
         help="extra apt packages, space separated")
@@ -553,11 +630,9 @@ def main(argv=None):
         err(f"GitHub authentication failed.\n{e}\nRun: gh auth login")
         return 1
 
-    # 3. Build repo from env (or flag).
+    # 3. Build repo: flag, else env, else built-in default.
     if not args.repo:
-        err("REMOTE_BUILD_REPO is not set. "
-            "Example: export REMOTE_BUILD_REPO=OWNER/remote-rust-build")
-        return 1
+        args.repo = DEFAULT_REPO
     try:
         owner, _ = parse_repo(args.repo)
     except RuntimeError as e:
@@ -678,8 +753,11 @@ def main(argv=None):
                   "-f", f"build_command={args.command}",
                   "-f", f"apt_packages={args.apt}", check=False)
         if trig.returncode != 0:
-            log("workflow_dispatch failed; falling back to push trigger "
-                "(build.yml also runs on push to remote-build/**).")
+            raise RuntimeError(
+                "workflow_dispatch failed (build.yml is dispatch-only; "
+                "pushing the branch alone triggers nothing). "
+                "Is build.yml on the build repo's default branch, and "
+                "does your token allow running workflows?")
 
         # 11. Find exact run (unique branch => no cross-talk).
         log("locating workflow run...")
@@ -698,7 +776,7 @@ def main(argv=None):
         finally:
             pulse_stop()
         viewed = gh("run", "view", run_id, "--repo", repo,
-                    "--log", check=False)
+                    "--log", check=False, timeout=600)
         cleaned = clean_log(viewed.stdout)
         if args.raw_log:
             say("---- remote build log (raw `gh run view --log`) ----")
@@ -742,18 +820,20 @@ def main(argv=None):
         out_dir.mkdir(parents=True, exist_ok=True)
         log(f"downloading artifact {artifact}...")
         dl = gh("run", "download", run_id, "--repo", repo,
-                "-n", artifact, "-D", str(out_dir), check=False)
+                "-n", artifact, "-D", str(out_dir), check=False,
+                timeout=600)
         if dl.returncode != 0:
             log("exact artifact name not found; downloading all "
                 "artifacts for the run...")
             dl = gh("run", "download", run_id, "--repo", repo,
-                    "-D", str(out_dir), check=False)
+                    "-D", str(out_dir), check=False, timeout=600)
             if dl.returncode != 0:
                 try:
                     total = gh("api",
                                f"repos/{repo}/actions/runs/{run_id}/"
                                f"artifacts",
-                               "--jq", ".total_count").stdout.strip()
+                               "--jq", ".total_count",
+                               timeout=120).stdout.strip()
                 except RuntimeError:
                     total = ""
                 if total == "0":

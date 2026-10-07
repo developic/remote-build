@@ -17,7 +17,7 @@ deleted afterwards.
 ```text
 local project
   ↓ python makes temp .tar.gz (excludes .git/ target/ .env *.key *.pem)
-  ↓ temp branch remote-build/<id> in THIS repo (matches remote-build/** trigger)
+  ↓ temp branch remote-build/<id> in THIS repo (dispatch-only trigger)
   ↓ upload source into project/ + trigger build.yml (workflow_dispatch)
   ↓ wait, print real compiler output
   ↓ download binary on success
@@ -77,6 +77,8 @@ Flags:
 --output DIR       binary download dir (default: remote-build-output/)
 --timeout-mins N   wait limit (default: 45)
 --raw-log          full `gh run view --log` (default: cleaned compiler log)
+--verbose          print all progress lines (default is quiet: a live
+                   one-line progress indicator plus errors only)
 ```
 
 Exit code mirrors the remote build: `0` on success, non-zero on
@@ -99,13 +101,13 @@ success, so there is nothing to pull; fix the logged error and re-run.
    `.git/ target/ node_modules/ dist/ .env *.key *.pem` and similar
    credential files. Your repo is never modified.
 3. **Temp branch.** Shallow-clones this repo to a temp dir, creates a
-   unique branch `remote-build/<utc>-<rand>` (matches the workflow's
-   `remote-build/**` glob), extracts the archive into
+   unique branch `remote-build/<utc>-<rand>`, extracts the archive
+   into
    `project/`, writes `remote-build-command.txt` /
    `remote-build-apt.txt` / `remote-build-id.txt`, commits, pushes.
 4. **Trigger.** Runs the documented
    `gh workflow run build.yml --ref <branch> -f build_id=... -f build_command=...`
-   (`push` on `remote-build/**` is a fallback trigger).
+   (dispatch-only: exactly one run per build).
 5. **Find + wait.** Polls `gh run list --branch <branch>` — the branch
    is unique, so concurrent builds never mix — then
    `gh run watch --exit-status`.

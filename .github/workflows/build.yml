@@ -1,6 +1,8 @@
 name: Remote build
 
-# Temporary per-build branches only. Permanent branches never trigger.
+# Dispatch-only: the client triggers exactly one run per build with
+# `gh workflow run build.yml --ref <temp-branch>`. Pushing the temp
+# branch alone triggers nothing, so each build costs one run.
 # ("on" is quoted: plain `on:` parses as boolean true in YAML 1.1.)
 "on":
   workflow_dispatch:
@@ -19,9 +21,6 @@ name: Remote build
         required: false
         default: ""
         type: string
-  push:
-    branches:
-      - "remote-build/**"
 
 # Minimal permissions: read the uploaded source, build it, upload a
 # short-lived artifact. Never pushes, never deletes branches.
@@ -116,6 +115,35 @@ jobs:
           echo "node=$NODE" >> "$GITHUB_OUTPUT"
           echo "rust=$RUST go=$GO node=$NODE"
 
+      - name: Fingerprint project (stable cache namespace)
+        id: fingerprint
+        run: |
+          # Stable per-project slug from the manifest identity, so 10
+          # different projects sharing this workflow never share cache
+          # entries. Deliberately NOT the build ID (unique per build):
+          # the key must be identical across rebuilds of the same project.
+          # Lockfile/toolchain hashes are appended by each cache action,
+          # so dep or compiler changes still invalidate correctly.
+          SLUG="unknown"
+          if [ -f project/Cargo.toml ]; then
+            NAME="$(sed -n -E 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' project/Cargo.toml 2>/dev/null | head -n 1)"
+            SLUG="rust-${NAME:-unknown}"
+          elif [ -f project/go.mod ]; then
+            MOD="$(sed -n -E 's/^module[[:space:]]+([^[:space:]]+).*/\1/p' project/go.mod 2>/dev/null | head -n 1)"
+            MOD="${MOD##*/}"
+            SLUG="go-${MOD:-unknown}"
+          elif [ -f project/package.json ]; then
+            NAME="$(sed -n -E 's/^[[:space:]]*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' project/package.json 2>/dev/null | head -n 1)"
+            NAME="${NAME##*/}"
+            SLUG="node-${NAME:-unknown}"
+          fi
+          # Sanitize to [A-Za-z0-9_-], cap length for cache-key limits.
+          SLUG="$(echo "$SLUG" | tr -c 'A-Za-z0-9_-' '-' | cut -c1-48)"
+          SLUG="$(echo "$SLUG" | sed -E 's/^-+//; s/-+$//')"
+          if [ -z "$SLUG" ]; then SLUG="unknown"; fi
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+          echo "Cache namespace: $SLUG"
+
       - name: Detect Rust toolchain
         id: toolchain
         if: steps.detect.outputs.rust == 'true'
@@ -142,16 +170,25 @@ jobs:
 
       - name: Set up Go
         if: steps.detect.outputs.go == 'true'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: project/go.mod
+          # Built-in cache: Go module + build cache. The key already
+          # includes OS, toolchain version and the go.sum hash, so each
+          # project (different go.sum) gets its own isolated entry and
+          # dep changes invalidate only that project's cache.
+          cache: true
           cache-dependency-path: project/go.sum
 
       - name: Set up Node.js
         if: steps.detect.outputs.node == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 24
+          # Built-in cache: npm store keyed by OS, Node version and the
+          # package-lock.json hash. Different projects (different
+          # lockfiles) never share entries; updating one project's
+          # lockfile invalidates only its own cache.
           cache: npm
           cache-dependency-path: project/package-lock.json
 
@@ -169,6 +206,21 @@ jobs:
         if: steps.detect.outputs.rust == 'true'
         uses: Swatinem/rust-cache@v2
         with:
+          # shared-key namespaces the cache per project (rust-<pkgname>):
+          # project-a and project-b never fight over the same target/
+          # entry and can build in parallel. The final key still appends
+          # OS, the active toolchain version and the Cargo.toml/lock
+          # hashes automatically, so dep/compiler changes invalidate only
+          # that project's cache.
+          # NOTE on temp branches: GitHub only lets a run read caches
+          # from its own branch or the default branch, never from sibling
+          # temp branches. So a rebuild reuses a cache entry only if it
+          # is reachable from main (or its own branch); every project's
+          # first build is cold, and orphaned temp-branch entries are
+          # evicted by GitHub's cache quota. For warm-every-time Rust
+          # builds across temp branches, the follow-up is sccache with
+          # external (S3/R2) storage instead of actions/cache.
+          shared-key: ${{ steps.fingerprint.outputs.slug }}
           workspaces: |
             project -> project/target
 
