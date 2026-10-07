@@ -17,7 +17,7 @@ deleted afterwards.
 ```text
 local project
   ↓ python makes temp .tar.gz (excludes .git/ target/ .env *.key *.pem)
-  ↓ temp branch remote-build-<id> in THIS repo
+  ↓ temp branch remote-build/<id> in THIS repo (matches remote-build/** trigger)
   ↓ upload source into project/ + trigger build.yml (workflow_dispatch)
   ↓ wait, print real compiler output
   ↓ download binary on success
@@ -76,11 +76,19 @@ Flags:
 --apt "pkgs..."    extra apt packages (also $REMOTE_BUILD_APT_PACKAGES)
 --output DIR       binary download dir (default: remote-build-output/)
 --timeout-mins N   wait limit (default: 45)
+--raw-log          full `gh run view --log` (default: cleaned compiler log)
 ```
 
 Exit code mirrors the remote build: `0` on success, non-zero on
-failure. Compiler errors are printed locally via `gh run view --log`.
-On success the binary lands in `remote-build-output/`.
+failure. Only the cleaned compiler log is printed by default
+(grouped under `### <step>` headers, runner plumbing removed);
+pass `--raw-log` for the full output.
+Before pushing, the client verifies `project/` actually contains the
+manifest your command needs (e.g. `Cargo.toml` for `cargo ...`) and
+aborts with a clear error if you ran from the wrong directory.
+On success the binary lands in `remote-build-output/`. On failure no
+binary is downloaded — the workflow uploads the artifact only on
+success, so there is nothing to pull; fix the logged error and re-run.
 
 ## 3. How it works
 
@@ -91,7 +99,8 @@ On success the binary lands in `remote-build-output/`.
    `.git/ target/ node_modules/ dist/ .env *.key *.pem` and similar
    credential files. Your repo is never modified.
 3. **Temp branch.** Shallow-clones this repo to a temp dir, creates a
-   unique branch `remote-build-<utc>-<rand>`, extracts the archive into
+   unique branch `remote-build/<utc>-<rand>` (matches the workflow's
+   `remote-build/**` glob), extracts the archive into
    `project/`, writes `remote-build-command.txt` /
    `remote-build-apt.txt` / `remote-build-id.txt`, commits, pushes.
 4. **Trigger.** Runs the documented

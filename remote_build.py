@@ -22,12 +22,14 @@ import fnmatch
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -45,12 +47,69 @@ CREDENTIAL_PATTERNS = ("*.key", "*.pem", "*.p12", "*.pfx", "*.asc",
                        "credentials*.json", "*secret*", ".env*")
 
 
+_QUIET = False  # quiet by default: live one-line progress, errors only.
+_PULSE_STOP = threading.Event()
+_PULSE_THREAD = None
+
+
+def _clear_line():
+    sys.stdout.write("\r" + " " * 100 + "\r")
+    sys.stdout.flush()
+
+
 def log(msg):
+    """Progress info: full lines in verbose mode, live one-liner when quiet."""
+    if _QUIET:
+        sys.stdout.write("\r\u23f3 " + str(msg)[:96].ljust(96))
+        sys.stdout.flush()
+    else:
+        print(f"[remote-build] {msg}", flush=True)
+
+
+def say(msg):
+    """Always print a full line (clears the live progress line first)."""
+    if _QUIET:
+        _clear_line()
     print(f"[remote-build] {msg}", flush=True)
 
 
 def err(msg):
+    if _QUIET:
+        _clear_line()
     print(f"[remote-build] ERROR: {msg}", file=sys.stderr, flush=True)
+
+
+def pulse_start(label):
+    """Live elapsed-time ticker on one line while a long step blocks."""
+    global _PULSE_THREAD
+    if not _QUIET:
+        return
+    _PULSE_STOP.clear()
+
+    def tick():
+        start = time.time()
+        frames = "\u280b\u2819\u2839\u2838\u283c\u283e\u2840\u2847\u284d\u284e"
+        i = 0
+        while not _PULSE_STOP.wait(0.25):
+            el = int(time.time() - start)
+            sys.stdout.write(
+                f"\r{frames[i % len(frames)]} {label} "
+                f"({el // 60}m{el % 60:02d}s)")
+            sys.stdout.flush()
+            i += 1
+
+    _PULSE_THREAD = threading.Thread(target=tick, daemon=True)
+    _PULSE_THREAD.start()
+
+
+def pulse_stop():
+    global _PULSE_THREAD
+    if _PULSE_THREAD is not None:
+        _PULSE_STOP.set()
+        _PULSE_THREAD.join(timeout=2)
+        _PULSE_THREAD = None
+    if _QUIET:
+        _clear_line()
 
 
 def run(cmd, cwd=".", check=True, capture=True, env=None, timeout=None):
@@ -153,6 +212,10 @@ def create_archive(project_root, archive_path):
             tf.add(f, arcname=f.relative_to(project_root).as_posix())
     size = archive_path.stat().st_size
     log(f"archive: {archive_path} ({len(filtered)} files, {size} bytes).")
+    top = sorted({p.relative_to(project_root).as_posix().split("/")[0]
+                  for p in filtered})
+    log(f"archive top-level entries: {', '.join(top[:25])}"
+        + (" ..." if len(top) > 25 else ""))
     return len(filtered)
 
 
@@ -169,6 +232,156 @@ def gh(*args, cwd=".", check=True, timeout=60):
     return run(["gh", *args], cwd=cwd, check=check, timeout=timeout)
 
 
+# command prefix -> manifest that must exist at project/ root.
+# Catches the classic mistake of running from the parent directory
+# (manifest ends up nested, e.g. project/rust/Cargo.toml, and the
+# remote `cd project && cargo ...` fails with "could not find Cargo.toml").
+COMMAND_MANIFESTS = (
+    ("cargo", "Cargo.toml"),
+    ("go ", "go.mod"),
+    ("npm", "package.json"),
+    ("yarn", "package.json"),
+    ("pnpm", "package.json"),
+    ("make", "Makefile"),
+    ("cmake", "CMakeLists.txt"),
+)
+
+
+def check_staged_project(proj, command):
+    """Fail fast (before pushing) if project/ cannot satisfy the command."""
+    entries = [p for p in proj.iterdir()]
+    if not entries:
+        raise RuntimeError(
+            "staged project/ is empty — nothing would be built. "
+            "Are you running from the project root?")
+    for prefix, manifest in COMMAND_MANIFESTS:
+        if command.strip().startswith(prefix):
+            if not (proj / manifest).is_file():
+                nested = sorted(str(p.relative_to(proj).as_posix())
+                                for p in proj.rglob(manifest))
+                hint = (f" Found nested at: {', '.join(nested[:3])}."
+                        if nested else "")
+                raise RuntimeError(
+                    f"command starts with {prefix!r} but "
+                    f"project/{manifest} is missing.{hint} "
+                    f"Run from the directory containing {manifest}, "
+                    f"not its parent.")
+            break
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+# Same escapes, but transported as literal caret sequences (some
+# `gh`/pager paths render ESC as "^[").
+CARET_ESC_RE = re.compile(r"\^\[(?:\[[0-9;]*m|\(B|>)")
+STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s")
+# Runner plumbing hidden by the clean log (kept with --raw-log).
+NOISE_RES = (
+    re.compile(r"Temporarily overriding HOME="),
+    re.compile(r"Adding repository directory to the .* git .*config"),
+    re.compile(r"\[command\]/usr/bin/git (version|config|submodule)"),
+    re.compile(r"\[command\]"),
+    re.compile(r"^hint:"),
+    re.compile(r"^(Syncing repository|Deleting the contents|Prepare all required|"
+               r"Getting action download|Download action repository|"
+               r"Complete job name|Prepare workflow directory)"),
+    re.compile(r"git version \d"),
+    re.compile(r"^Post job cleanup\.?$"),
+    re.compile(r"^Cleaning up orphan processes\.?$"),
+    re.compile(r"Node\.js \d+ is deprecated"),
+    re.compile(r"^For more information see: https://github\.blog/changelog"),
+    re.compile(r"^shell: /usr/bin/bash"),
+    re.compile(r"actions/checkout@v4\. For more information"),
+)
+SKIP_STEPS = {"Post Check out temporary build branch", "Complete job",
+              "Set up job", "Set up runner"}
+
+
+def clean_log(raw):
+    """Turn `gh run view --log` into a readable compiler log.
+
+    Groups lines under `### <step>` headers, strips ANSI colour codes
+    and timestamps, drops runner plumbing (git safe.directory setup,
+    post-job cleanup, Node deprecation notices). Returns one string.
+    """
+    out = []
+    current_step = None
+
+    def scrub(text):
+        return CARET_ESC_RE.sub("",
+                                ANSI_RE.sub("", text).replace("﻿", ""))
+    for raw_line in (raw or "").splitlines():
+        line = scrub(raw_line)
+        if "\t" in line:
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                _job, step, msg = parts[0], parts[1], "\t".join(parts[2:])
+                msg = STAMP_RE.sub("", msg)
+                if step in SKIP_STEPS:
+                    continue
+                if any(rx.search(msg) for rx in NOISE_RES):
+                    continue
+                if not msg.strip():
+                    continue
+                if step != current_step:
+                    out.append(f"\n### {step}")
+                    current_step = step
+                out.append(msg)
+                continue
+        msg = STAMP_RE.sub("", line).rstrip()
+        if not msg.strip() or any(rx.search(msg) for rx in NOISE_RES):
+            continue
+        out.append(msg)
+    return "\n".join(out).strip() + "\n"
+
+
+def error_section(cleaned, max_lines=80):
+    """The failing step's output only (quiet mode): prefers the section
+    holding the executed build command / compiler errors, else the tail."""
+    sections, cur = [], []
+    for line in (cleaned or "").splitlines():
+        if line.startswith("### "):
+            if cur:
+                sections.append(cur)
+            cur = [line]
+        else:
+            cur.append(line)
+    if cur:
+        sections.append(cur)
+
+    def score(sec):
+        text = "\n".join(sec)
+        hits = sum(1 for kw in ("error", "Error", "ERROR", "FAILED",
+                                "failed", "panic", "mismatched")
+                   if kw in text)
+        if sec and "Build" in sec[0]:
+            hits += 2
+        return hits
+
+    if not sections:
+        body = []
+    else:
+        best = max(sections, key=score)
+        body = best if score(best) > 0 else sections[-1]
+    body = [l for l in body if l.strip()]
+    if len(body) > max_lines:
+        body = (["... (truncated; re-run with --raw-log for the full log)"]
+                + body[-max_lines:])
+    return "\n".join(body).strip() + "\n"
+
+
+def list_branch_runs(repo, branch, limit=10):
+    """All run IDs on a branch (dispatch + push siblings). Never raises."""
+    try:
+        r = gh("run", "list", "--workflow", WORKFLOW_FILE,
+               "--branch", branch, "--limit", str(limit),
+               "--json", "databaseId",
+               "--repo", repo, check=False)
+        return [str(x["databaseId"])
+                for x in (json.loads(r.stdout or "[]"))]
+    except Exception:
+        return []
+
+
 def parse_repo(repo):
     if "/" not in repo or repo.count("/") != 1:
         raise RuntimeError(
@@ -180,9 +393,14 @@ def parse_repo(repo):
 
 
 def generate_build_id():
+    """Unique per-build suffix. The temp branch is remote-build/<suffix>
+    so it matches the workflow's `remote-build/**` trigger glob; the
+    build ID (no slash, safe for artifact names) is remote-build-<suffix>.
+    Returns (build_id, branch)."""
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
     rnd = f"{random.getrandbits(32):08x}"
-    return f"remote-build-{ts}-{rnd}"
+    suffix = f"{ts}-{rnd}"
+    return f"remote-build-{suffix}", f"remote-build/{suffix}"
 
 
 class Cleanup:
@@ -198,22 +416,35 @@ class Cleanup:
         self.branch_deleted = False
 
     def cleanup(self, cancel_first=False):
-        if cancel_first and self.run_id and not self.run_deleted:
+        # Collect every run on the temp branch: workflow_dispatch and the
+        # push-triggered sibling both fire, and both must be removed.
+        ids = []
+        if self.run_id:
+            ids.append(str(self.run_id))
+        if self.branch and self.branch not in PROTECTED_BRANCHES:
+            for rid in list_branch_runs(self.repo, self.branch):
+                if rid not in ids:
+                    ids.append(rid)
+        for rid in ids:
+            if cancel_first:
+                try:
+                    log(f"cancelling run {rid}...")
+                    gh("run", "cancel", rid,
+                       "--repo", self.repo, check=False)
+                except Exception:
+                    pass
+        for rid in ids:
+            if self.run_deleted and rid == str(self.run_id or ""):
+                continue
             try:
-                log(f"cancelling run {self.run_id}...")
-                gh("run", "cancel", str(self.run_id),
-                   "--repo", self.repo, check=False)
-            except Exception:
-                pass
-        if self.run_id and not self.run_deleted:
-            try:
-                log(f"deleting workflow run {self.run_id} "
+                log(f"deleting workflow run {rid} "
                     f"(artifact + logs)...")
-                gh("run", "delete", str(self.run_id),
+                gh("run", "delete", rid,
                    "--repo", self.repo, check=False)
-                self.run_deleted = True
+                if rid == str(self.run_id or ""):
+                    self.run_deleted = True
             except Exception as e:
-                log(f"WARNING: run delete failed: {e}")
+                log(f"WARNING: run delete failed for {rid}: {e}")
         if self.branch and self.branch not in PROTECTED_BRANCHES \
                 and not self.branch_deleted:
             try:
@@ -301,7 +532,16 @@ def main(argv=None):
                     help="directory for the downloaded binary")
     ap.add_argument("--timeout-mins", type=int, default=45,
                     help="max minutes to wait for the run")
+    ap.add_argument("--raw-log", action="store_true",
+                    help="print the full unfiltered `gh run view --log` "
+                         "output (default prints a cleaned compiler log)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="print all progress lines (default is quiet: a "
+                         "live one-line progress indicator plus errors "
+                         "only)")
     args = ap.parse_args(argv)
+    global _QUIET
+    _QUIET = not args.verbose
 
     # 1-2. Tool + auth checks.
     ok = all(check_tool(t) for t in ("python", "git", "gh"))
@@ -333,13 +573,13 @@ def main(argv=None):
         return 1
 
     project_root = Path.cwd()
-    build_id = generate_build_id()
-    branch = build_id  # unique branch == unique build id
+    build_id, branch = generate_build_id()
     artifact = f"{ARTIFACT_PREFIX}-{build_id}"
     log(f"build ID: {build_id}")
+    log(f"branch:   {branch}")
     log(f"command:  {args.command}")
 
-    if branch in PROTECTED_BRANCHES:
+    if branch in PROTECTED_BRANCHES or build_id in PROTECTED_BRANCHES:
         err(f"refusing to use protected branch name {branch}")
         return 1
 
@@ -348,7 +588,8 @@ def main(argv=None):
 
     def on_signal(signum, frame):
         interrupted["flag"] = True
-        log("interrupted; cancelling and cleaning up...")
+        pulse_stop()
+        say("interrupted; cancelling and cleaning up...")
         state.cleanup(cancel_first=True)
         sys.exit(130)
 
@@ -390,6 +631,11 @@ def main(argv=None):
                     shutil.copy2(item, dest)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+        # Fail fast before pushing: a missing manifest here means the
+        # remote `cd project && <command>` could never succeed.
+        check_staged_project(proj, args.command)
+        log("staged project/ OK "
+            f"({len(list(proj.rglob('*')))} entries).")
         (clone_dir / "remote-build-command.txt").write_text(
             args.command + "\n")
         (clone_dir / "remote-build-apt.txt").write_text(
@@ -439,21 +685,31 @@ def main(argv=None):
         log("locating workflow run...")
         run_id = find_run(repo, branch, since_epoch=since)
         state.run_id = run_id
-        log(f"run: https://github.com/{repo}/actions/runs/{run_id}")
+        say(f"run: https://github.com/{repo}/actions/runs/{run_id}")
 
         # 12-13. Wait, then print real compiler/build output.
         log(f"waiting up to {args.timeout_mins} min "
             f"(gh run watch)... Ctrl+C cancels.")
-        watch = gh("run", "watch", run_id, "--repo", repo,
-                   "--exit-status", "--interval", "10",
-                   check=False, timeout=args.timeout_mins * 60 + 60)
-        log("---- remote build log (gh run view --log) ----")
+        pulse_start("building on GitHub Actions")
+        try:
+            watch = gh("run", "watch", run_id, "--repo", repo,
+                       "--exit-status", "--interval", "10",
+                       check=False, timeout=args.timeout_mins * 60 + 60)
+        finally:
+            pulse_stop()
         viewed = gh("run", "view", run_id, "--repo", repo,
                     "--log", check=False)
-        print(viewed.stdout, end="")
+        cleaned = clean_log(viewed.stdout)
+        if args.raw_log:
+            say("---- remote build log (raw `gh run view --log`) ----")
+            print(viewed.stdout, end="")
+            say("---- end of remote build log ----")
+        elif not _QUIET:
+            say("---- remote build log (cleaned; --raw-log for full) ----")
+            print(cleaned, end="")
+            say("---- end of remote build log ----")
         if viewed.stderr:
             print(viewed.stderr, end="", file=sys.stderr)
-        log("---- end of remote build log ----")
 
         concl = ""
         try:
@@ -468,10 +724,20 @@ def main(argv=None):
             return 130
         if not success:
             err(f"remote build failed "
-                f"(conclusion={concl or 'failure'}).")
+                f"(conclusion={concl or 'failure'}). "
+                f"No binary was downloaded: the workflow uploads the "
+                f"artifact only on success, so there is nothing to pull. "
+                f"Cleanup below still deletes the run and branch.")
+            if _QUIET and not args.raw_log:
+                say("---- failing step (re-run with --verbose or "
+                    "--raw-log for everything) ----")
+                print(error_section(cleaned), end="")
             return 1
 
-        # 14-16. Success: download compiled binary.
+        # 14-16. Success: download compiled binary. Check-type commands
+        # (e.g. `cargo check`) intentionally produce no binary: the
+        # workflow then uploads nothing, which is a successful outcome,
+        # not an error.
         out_dir = (project_root / args.output)
         out_dir.mkdir(parents=True, exist_ok=True)
         log(f"downloading artifact {artifact}...")
@@ -483,6 +749,19 @@ def main(argv=None):
             dl = gh("run", "download", run_id, "--repo", repo,
                     "-D", str(out_dir), check=False)
             if dl.returncode != 0:
+                try:
+                    total = gh("api",
+                               f"repos/{repo}/actions/runs/{run_id}/"
+                               f"artifacts",
+                               "--jq", ".total_count").stdout.strip()
+                except RuntimeError:
+                    total = ""
+                if total == "0":
+                    say("remote build SUCCEEDED (no binary artifact: "
+                        "expected for check-type commands such as "
+                        "`cargo check`; nothing to download).")
+                    exit_code = 0
+                    return 0
                 err("artifact download failed (nothing uploaded?).")
                 return 1
         files = [p for p in out_dir.rglob("*") if p.is_file()]
@@ -490,8 +769,8 @@ def main(argv=None):
             err("download produced no files.")
             return 1
         for f in files:
-            log(f"binary: {f} ({f.stat().st_size} bytes)")
-        log("remote build SUCCEEDED.")
+            say(f"binary: {f} ({f.stat().st_size} bytes)")
+        say("remote build SUCCEEDED.")
         exit_code = 0
         return 0
     except SystemExit as e:
