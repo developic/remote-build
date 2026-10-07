@@ -118,11 +118,17 @@ success, so there is nothing to pull; fix the logged error and re-run.
    clone dir. `Ctrl+C` cancels the run first (`gh run cancel`), then
    cleans up. `main`/`master` are never touched.
 
-Workflow details (`build.yml`): `workflow_dispatch` + `push`
-triggers, `permissions: contents: read`, checks out the temp branch,
-auto-detects Rust (`Cargo.toml`, respects `rust-toolchain.toml`) / Go
-(`go.mod`) / Node (`package.json`), runs your command, uploads
-`remote-build-binary-<build_id>` with `retention-days: 1`.
+Workflow details (`build.yml`): `workflow_dispatch` with per-project
+cache key `remote-build-cache-<slug>-<lock>-<cmd>`, `permissions:
+contents: read, actions: read`, checks out the temp branch, restores
+the shared cache (read-only — temp branches can only read main-scope
+entries), auto-detects Rust (`Cargo.toml`, respects
+`rust-toolchain.toml`) / Go (`go.mod`) / Node (`package.json`), runs
+your command, uploads `remote-build-binary-<build_id>` plus a
+`cache-payload-<slug>` (both `retention-days: 1`). After success the
+client dispatches `seed-cache.yml` on `main`, which saves the payload
+to main-scope cache so the next build of the same project is warm
+(`--no-seed` skips this).
 
 ## 4. Troubleshooting
 

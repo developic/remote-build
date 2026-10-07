@@ -1,0 +1,84 @@
+name: Seed shared cache
+
+# Identifiable per seeding: the client locates its own seeder run by
+# matching this title (several seeders may run on main concurrently).
+run-name: Seed ${{ inputs.slug }} from run ${{ inputs.payload_run_id }}
+
+# Short helper run ON the default branch. A temp-branch build uploads
+# its compiled dependencies as a `cache-payload-<slug>` artifact; the
+# client then dispatches this workflow on main, which downloads that
+# payload and saves it via actions/cache. The save lands in MAIN scope,
+# which every future temp branch can restore from -- temp branches can
+# never share caches with each other directly.
+#
+# The client deletes this run afterwards (cache entries survive run
+# deletion; artifacts do not need to, the payload already died with the
+# temp run). Nothing is committed, no branches are created here.
+"on":
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: "Stable per-project cache namespace (e.g. rust-mu)"
+        required: true
+        type: string
+      payload_run_id:
+        description: "Temp-branch run holding the cache-payload artifact"
+        required: true
+        type: string
+      cache_key:
+        description: "Exact cache key to save"
+        required: true
+        type: string
+
+# contents:read is unused here (no checkout) but explicit; actions:write
+# is required for actions/cache/save.
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download cache payload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p payload
+          gh run download "${{ inputs.payload_run_id }}" \
+            -n "cache-payload-${{ inputs.slug }}" \
+            -D payload --repo "${{ github.repository }}"
+          echo "Payload contents:"
+          find payload -type f -exec du -h {} + || true
+
+      - name: Restore payload trees
+        run: |
+          mkdir -p ~/.cargo ~/go project
+          if [ -f payload/home-cache.tar.gz ]; then
+            tar -xzf payload/home-cache.tar.gz -C "$HOME"
+          fi
+          if [ -f payload/ws-cache.tar.gz ]; then
+            tar -xzf payload/ws-cache.tar.gz -C "$GITHUB_WORKSPACE"
+          fi
+          echo "Restored sizes:"
+          du -sh ~/.cargo ~/go project 2>/dev/null || true
+          if [ -z "$(ls -A ~/.cargo project 2>/dev/null)" ]; then
+            echo "ERROR: payload extracted nothing usable." >&2
+            exit 1
+          fi
+
+      - name: Save shared cache (main scope)
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.npm
+            project/target
+          key: ${{ inputs.cache_key }}

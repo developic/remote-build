@@ -3,6 +3,13 @@ name: Remote build
 # Dispatch-only: the client triggers exactly one run per build with
 # `gh workflow run build.yml --ref <temp-branch>`. Pushing the temp
 # branch alone triggers nothing, so each build costs one run.
+#
+# Caching model (see seed-cache.yml): temp branches can only READ
+# caches from their own branch or the default branch, never from
+# sibling temp branches. So this workflow only RESTORES (exact key,
+# then per-project prefix fallbacks); a short `seed-cache` run on
+# `main` SAVES to main scope after each successful build, making the
+# next build of the same project warm.
 # ("on" is quoted: plain `on:` parses as boolean true in YAML 1.1.)
 "on":
   workflow_dispatch:
@@ -21,11 +28,28 @@ name: Remote build
         required: false
         default: ""
         type: string
+      cache_slug:
+        description: "Stable per-project cache namespace (e.g. rust-mu)"
+        required: false
+        default: ""
+        type: string
+      cache_lock:
+        description: "16-hex lockfile fingerprint (deterministic per deps)"
+        required: false
+        default: ""
+        type: string
+      cache_cmd:
+        description: "12-hex build-command fingerprint (debug vs release)"
+        required: false
+        default: ""
+        type: string
 
-# Minimal permissions: read the uploaded source, build it, upload a
-# short-lived artifact. Never pushes, never deletes branches.
+# Minimal permissions: read the uploaded source and read shared caches.
+# Never pushes, never deletes branches, never writes caches (the
+# main-scope seeder does the saving).
 permissions:
   contents: read
+  actions: read
 
 jobs:
   build:
@@ -92,6 +116,51 @@ jobs:
           echo "Resolved command:  $CMD"
           echo "Resolved apt:      ${APT:-<none>}"
 
+          # Shared-cache key: remote-build-cache-<slug>-<lock16>-<cmd12>.
+          # Inputs (computed deterministically by the client) win; else
+          # compute locally so manual dispatches still work. Slug =
+          # stable project identity (NOT the per-build ID); lock = deps;
+          # cmd = profile (check vs release must not share a target/).
+          SLUG="${{ inputs.cache_slug }}"
+          if [ -z "$SLUG" ]; then
+            SLUG="unknown"
+            if [ -f project/Cargo.toml ]; then
+              NAME="$(sed -n -E 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' project/Cargo.toml 2>/dev/null | head -n 1)"
+              SLUG="rust-${NAME:-unknown}"
+            elif [ -f project/go.mod ]; then
+              MOD="$(sed -n -E 's/^module[[:space:]]+([^[:space:]]+).*/\1/p' project/go.mod 2>/dev/null | head -n 1)"
+              MOD="${MOD##*/}"
+              SLUG="go-${MOD:-unknown}"
+            elif [ -f project/package.json ]; then
+              NAME="$(sed -n -E 's/^[[:space:]]*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' project/package.json 2>/dev/null | head -n 1)"
+              NAME="${NAME##*/}"
+              SLUG="node-${NAME:-unknown}"
+            fi
+            SLUG="$(echo "$SLUG" | tr -c 'A-Za-z0-9_-' '-' | cut -c1-48 | sed -E 's/^-+//; s/-+$//')"
+            if [ -z "$SLUG" ]; then SLUG="unknown"; fi
+          fi
+          LOCK="${{ inputs.cache_lock }}"
+          if [ -z "$LOCK" ]; then
+            if ls project/Cargo.lock project/go.sum project/package-lock.json >/dev/null 2>&1; then
+              LOCK="$(cat project/Cargo.lock project/go.sum project/package-lock.json 2>/dev/null | sha256sum | cut -c1-16)"
+            else
+              LOCK="nolock"
+            fi
+          fi
+          CMDHASH="${{ inputs.cache_cmd }}"
+          if [ -z "$CMDHASH" ]; then
+            CMDHASH="$(printf '%s' "$CMD" | sha256sum | cut -c1-12)"
+          fi
+          CACHE_KEY="remote-build-cache-${SLUG}-${LOCK}-${CMDHASH}"
+          CACHE_PREFIX="remote-build-cache-${SLUG}-"
+          echo "cache_slug=$SLUG" >> "$GITHUB_OUTPUT"
+          echo "cache_key=$CACHE_KEY" >> "$GITHUB_OUTPUT"
+          echo "cache_prefix=$CACHE_PREFIX" >> "$GITHUB_OUTPUT"
+          echo "REMOTE_BUILD_CACHE_KEY=$CACHE_KEY" >> "$GITHUB_ENV"
+          echo "REMOTE_BUILD_CACHE_PREFIX=$CACHE_PREFIX" >> "$GITHUB_ENV"
+          echo "Cache key:    $CACHE_KEY"
+          echo "Cache prefix: $CACHE_PREFIX"
+
       - name: Install system dependencies
         run: |
           if [ -n "$REMOTE_BUILD_APT" ]; then
@@ -114,35 +183,6 @@ jobs:
           echo "go=$GO" >> "$GITHUB_OUTPUT"
           echo "node=$NODE" >> "$GITHUB_OUTPUT"
           echo "rust=$RUST go=$GO node=$NODE"
-
-      - name: Fingerprint project (stable cache namespace)
-        id: fingerprint
-        run: |
-          # Stable per-project slug from the manifest identity, so 10
-          # different projects sharing this workflow never share cache
-          # entries. Deliberately NOT the build ID (unique per build):
-          # the key must be identical across rebuilds of the same project.
-          # Lockfile/toolchain hashes are appended by each cache action,
-          # so dep or compiler changes still invalidate correctly.
-          SLUG="unknown"
-          if [ -f project/Cargo.toml ]; then
-            NAME="$(sed -n -E 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' project/Cargo.toml 2>/dev/null | head -n 1)"
-            SLUG="rust-${NAME:-unknown}"
-          elif [ -f project/go.mod ]; then
-            MOD="$(sed -n -E 's/^module[[:space:]]+([^[:space:]]+).*/\1/p' project/go.mod 2>/dev/null | head -n 1)"
-            MOD="${MOD##*/}"
-            SLUG="go-${MOD:-unknown}"
-          elif [ -f project/package.json ]; then
-            NAME="$(sed -n -E 's/^[[:space:]]*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' project/package.json 2>/dev/null | head -n 1)"
-            NAME="${NAME##*/}"
-            SLUG="node-${NAME:-unknown}"
-          fi
-          # Sanitize to [A-Za-z0-9_-], cap length for cache-key limits.
-          SLUG="$(echo "$SLUG" | tr -c 'A-Za-z0-9_-' '-' | cut -c1-48)"
-          SLUG="$(echo "$SLUG" | sed -E 's/^-+//; s/-+$//')"
-          if [ -z "$SLUG" ]; then SLUG="unknown"; fi
-          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
-          echo "Cache namespace: $SLUG"
 
       - name: Detect Rust toolchain
         id: toolchain
@@ -173,24 +213,18 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: project/go.mod
-          # Built-in cache: Go module + build cache. The key already
-          # includes OS, toolchain version and the go.sum hash, so each
-          # project (different go.sum) gets its own isolated entry and
-          # dep changes invalidate only that project's cache.
-          cache: true
-          cache-dependency-path: project/go.sum
+          # Built-in caching disabled: module/build caches are covered
+          # by the explicit shared-cache restore below (saves would land
+          # on the throwaway branch scope and never be reused).
+          cache: false
 
       - name: Set up Node.js
         if: steps.detect.outputs.node == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: 24
-          # Built-in cache: npm store keyed by OS, Node version and the
-          # package-lock.json hash. Different projects (different
-          # lockfiles) never share entries; updating one project's
-          # lockfile invalidates only its own cache.
-          cache: npm
-          cache-dependency-path: project/package-lock.json
+          # No built-in cache: the npm store is covered by the explicit
+          # shared-cache restore below (same branch-scope reason).
 
       - name: Show toolchain versions
         run: |
@@ -202,30 +236,34 @@ jobs:
           if [ -f project/rust-toolchain.toml ]; then echo "--- rust-toolchain.toml ---"; cat project/rust-toolchain.toml; fi
           if [ -f project/rust-toolchain ]; then echo "--- rust-toolchain ---"; cat project/rust-toolchain; fi
 
-      - name: Cache Cargo dependencies
-        if: steps.detect.outputs.rust == 'true'
-        uses: Swatinem/rust-cache@v2
+      - name: Prepare cache directories
+        run: |
+          # actions/cache errors when none of its paths exist; a cold
+          # worker with a fresh checkout has none of these yet.
+          mkdir -p project/target ~/.cargo/registry ~/.cargo/git \
+            ~/go/pkg/mod ~/.cache/go-build ~/.npm
+
+      - name: Restore shared cache (main scope)
+        uses: actions/cache/restore@v4
         with:
-          # shared-key namespaces the cache per project (rust-<pkgname>):
-          # project-a and project-b never fight over the same target/
-          # entry and can build in parallel. The final key still appends
-          # OS, the active toolchain version and the Cargo.toml/lock
-          # hashes automatically, so dep/compiler changes invalidate only
-          # that project's cache.
-          # NOTE on temp branches: GitHub only lets a run read caches
-          # from its own branch or the default branch, never from sibling
-          # temp branches -- and each build uses a fresh branch, so a
-          # restore can only ever hit entries reachable from main. Saving
-          # is therefore disabled (save-if: false): it would only write
-          # ~64 MB orphans scoped to deleted branches on every build.
-          # Restore stays enabled (free if main ever holds entries).
-          # For warm-every-time Rust builds across temp branches, the
-          # follow-up is sccache with external (S3/R2) storage instead
-          # of actions/cache.
-          shared-key: ${{ steps.fingerprint.outputs.slug }}
-          save-if: false
-          workspaces: |
-            project -> project/target
+          # Exact key first (same project + deps + command), then the
+          # per-project prefix (same project, older deps), then anything.
+          # Cargo/Go fingerprints make cross-project restores safe: stale
+          # entries only cost a rebuild, never a wrong binary.
+          # Read-only: temp branches cannot write usable entries, so the
+          # seed-cache workflow on main does all the saving.
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.npm
+            project/target
+          key: ${{ steps.resolve.outputs.cache_key }}
+          restore-keys: |
+            ${{ steps.resolve.outputs.cache_prefix }}
+            remote-build-cache-
+          fail-on-cache-miss: false
 
       - name: Build uploaded project
         run: |
@@ -260,8 +298,51 @@ jobs:
           if-no-files-found: warn
           retention-days: 1
 
+      - name: Pack cache payload
+        id: payload
+        if: success()
+        run: |
+          # Bundle everything worth reusing (registries, module stores,
+          # compiled target/) into two trees: $HOME content and workspace
+          # content. The seed-cache run on main downloads this artifact
+          # and saves it to main-scope cache; the temp run itself can
+          # never write a reusable entry. Skipped when absurdly large.
+          mkdir -p cache-out
+          (
+            cd "$HOME"
+            divulge() { [ -e "$1" ] && echo "$1"; }
+            # shellcheck disable=SC2046
+            tar -czf "$GITHUB_WORKSPACE/cache-out/home-cache.tar.gz" \
+              $(divulge .cargo/registry) $(divulge .cargo/git) \
+              $(divulge go/pkg/mod) $(divulge .cache/go-build) \
+              $(divulge .npm) || true
+          )
+          if [ -d project/target ]; then
+            tar -czf cache-out/ws-cache.tar.gz -C "$GITHUB_WORKSPACE" project/target || true
+          fi
+          ls -la cache-out/ || true
+          TOTAL="$(du -sb cache-out 2>/dev/null | cut -f1)"
+          COUNT="$(find cache-out -type f 2>/dev/null | wc -l)"
+          echo "payload_bytes=${TOTAL:-0}" >> "$GITHUB_OUTPUT"
+          echo "payload_files=${COUNT:-0}" >> "$GITHUB_OUTPUT"
+          echo "Payload: ${COUNT:-0} file(s), ${TOTAL:-0} bytes"
+          if [ "${TOTAL:-0}" -gt 2000000000 ]; then
+            echo "Payload over 2 GB cap; skipping cache upload."
+            rm -rf cache-out
+            echo "payload_files=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload cache payload
+        if: success() && steps.payload.outputs.payload_files != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-payload-${{ steps.resolve.outputs.cache_slug }}
+          path: cache-out/
+          if-no-files-found: ignore
+          retention-days: 1
+
       - name: Clean temporary workspace
         if: always()
         run: |
-          rm -rf dist || true
+          rm -rf dist cache-out || true
           echo "Runner workspace cleaned."
