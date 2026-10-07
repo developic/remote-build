@@ -654,9 +654,13 @@ def poll_run_to_completion(repo, run_id, run_url, timeout_mins=45):
             try:
                 r = gh("api",
                        f"repos/{repo}/actions/runs/{run_id}",
-                       "--jq", "\\(.status) \\(.conclusion)",
+                       "--jq", "[.status, .conclusion] | @tsv",
                        timeout=60)
-                status, concl = (r.stdout.split() + ["", ""])[:2]
+                parts = r.stdout.split("\t")
+                status = parts[0].strip() if parts else ""
+                concl = parts[1].strip() if len(parts) > 1 else ""
+                if concl == "null":
+                    concl = ""
             except RuntimeError:
                 status, concl = "", ""
             if status and status != phase:
