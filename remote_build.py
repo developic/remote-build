@@ -485,11 +485,21 @@ def flatten_output_dir(out_dir, before):
     `gh run download` (without -n) extracts each artifact into its own
     `<artifact-name>/` subfolder, and the artifact name contains the
     unique build ID -- without flattening, every build would add a new
-    per-build folder. Only folders created by the download (absent from
-    the `before` snapshot) are collapsed; anything else is left alone.
+    per-build folder. Folders created by the download (absent from the
+    `before` snapshot) are always collapsed; `remote-build-binary-*`
+    folders are ALWAYS collapsed even if pre-existing (leftovers from
+    older clients that created them); anything else is left alone.
     """
     for sub in sorted(p for p in out_dir.iterdir() if p.is_dir()):
+        if sub.name in before \
+                and not sub.name.startswith(ARTIFACT_PREFIX + "-"):
+            continue
         if sub.name in before:
+            # Stale leftover from an older client run: its binary is
+            # older than anything just downloaded, so delete it
+            # instead of merging it over the fresh files.
+            shutil.rmtree(sub, ignore_errors=True)
+            log(f"removed stale per-build folder: {sub.name}")
             continue
         for item in sorted(sub.rglob("*")):
             if not item.is_file():
