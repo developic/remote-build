@@ -3,16 +3,16 @@
 
 Usage (from any Rust / Go / Node.js project)::
 
-    export REMOTE_BUILD_REPO=OWNER/remote-rust-build
     python remote_build.py
     python remote_build.py --command "cargo check"
     python remote_build.py --command "go build -o dist/app ./..."
     python remote_build.py --command "npm ci && npm run build"
 
 Flow: archive current files -> temp branch in the dedicated build repo ->
-workflow_dispatch build.yml -> wait -> print compiler log -> download
-binary -> delete run/branch/local temp files.  Never commits in your
-project; the temporary commit lives only in the build repo.
+workflow_dispatch build.yml -> wait (live phase display) -> print
+compiler log -> download binary by its own artifact URL -> delete
+run/branch/local temp files -> print a timing breakdown. Never commits
+in your project; the temporary commit lives only in the build repo.
 Standard library only; GitHub auth is delegated to the `gh` CLI.
 """
 
@@ -188,6 +188,38 @@ def pulse_stop():
         _clear_line()
 
 
+def fmt_dur(seconds):
+    """7 -> '7s', 75 -> '1m15s'."""
+    total = max(0, int(seconds))
+    minutes, secs = divmod(total, 60)
+    return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
+
+
+class Timer:
+    """Per-stage stopwatch plus a final timing breakdown."""
+
+    def __init__(self):
+        self.t0 = time.time()
+        self.last = self.t0
+        self.rows = []
+
+    def mark(self, name, duration=None):
+        """Record a stage. With duration=None, uses time since last mark."""
+        now = time.time()
+        self.rows.append((name, duration if duration is not None
+                          else now - self.last))
+        self.last = now
+
+    def total(self):
+        return time.time() - self.t0
+
+    def report(self):
+        say("---- timing ----")
+        for name, secs in self.rows:
+            say(f"  {name:<12} {fmt_dur(secs)}")
+        say(f"  {'total':<12} {fmt_dur(self.total())}")
+
+
 def run(cmd, cwd=".", check=True, capture=True, env=None, timeout=None):
     """Run a subprocess; raise RuntimeError with stderr on failure."""
     result = subprocess.run(
@@ -252,10 +284,11 @@ def list_files_walk(project_root):
 
 def create_archive(project_root, archive_path):
     """Create temp .tar.gz of current files. Returns member count."""
-    if list_files_git(project_root) is not None and \
-            (project_root / ".git").exists():
-        files = list_files_git(project_root) or []
-        log(f"git ls-files found {len(files)} file(s).")
+    git_files = (list_files_git(project_root)
+                 if (project_root / ".git").exists() else None)
+    if git_files is not None:
+        log(f"git ls-files found {len(git_files)} file(s).")
+        files = git_files
     else:
         files = list_files_walk(project_root)
         log(f"directory scan found {len(files)} file(s).")
@@ -471,8 +504,8 @@ def flatten_output_dir(out_dir, before):
 
 def purge_cache_payload(out_dir):
     """Remove downloaded `cache-payload-*` entries (dependency tarballs
-    for the seeder, not build outputs). They arrive only via the
-    download-all fallback; the binary output must never contain them."""
+    from older seeder-era runs, not build outputs). The binary output
+    must never contain them."""
     for p in sorted(out_dir.iterdir()):
         if p.name.startswith("cache-payload-"):
             if p.is_dir():
@@ -592,10 +625,13 @@ def poll_run_to_completion(repo, run_id, run_url, timeout_mins=45):
     Polls the run status every 15s (queued -> in_progress -> completed),
     re-labels the live ticker on phase changes, and prints a full
     heartbeat line every 60s so even scrollback-only terminals prove
-    the client is alive. Returns the conclusion ("" on timeout).
+    the client is alive. Returns (conclusion, queued_secs, build_secs);
+    conclusion is "" on timeout.
     """
     deadline = time.time() + timeout_mins * 60
     started = time.time()
+    building_since = None
+    queued_secs = 0.0
     phase = ""
     last_beat = 0.0
     pulse_start("waiting for runner")
@@ -615,6 +651,9 @@ def poll_run_to_completion(repo, run_id, run_url, timeout_mins=45):
                 status, concl = "", ""
             if status and status != phase:
                 phase = status
+                if phase == "in_progress" and building_since is None:
+                    building_since = time.time()
+                    queued_secs = building_since - started
                 label = ("queued on GitHub-hosted runner"
                          if phase == "queued"
                          else "building on GitHub Actions"
@@ -629,15 +668,21 @@ def poll_run_to_completion(repo, run_id, run_url, timeout_mins=45):
                 say(f"still waiting... phase={phase or '?'} "
                     f"elapsed={el // 60}m{el % 60:02d}s ({run_url})")
             if status == "completed":
-                return concl or ""
+                if building_since is None:
+                    queued_secs = now - started
+                    return concl or "", queued_secs, 0.0
+                return concl or "", queued_secs, now - building_since
             time.sleep(15)
     finally:
         pulse_stop()
-    return ""
+    if building_since is None:
+        return "", time.time() - started, 0.0
+    now = time.time()
+    return "", building_since - started, now - building_since
 
 
 def list_branch_runs(repo, branch, limit=10, workflow=WORKFLOW_FILE):
-    """All run IDs on a branch (dispatch + push siblings). Never raises."""
+    """All run IDs on a branch. Never raises."""
     try:
         r = gh("run", "list", "--workflow", workflow,
                "--branch", branch, "--limit", str(limit),
@@ -744,6 +789,14 @@ class Cleanup:
                 log(f"WARNING: temp cleanup failed for {path}: {e}")
 
 
+def _created_ts(iso):
+    try:
+        return datetime.datetime.fromisoformat(
+            iso.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0
+
+
 def find_run(repo, branch, since_epoch, timeout_s=120,
              workflow=WORKFLOW_FILE):
     """Poll `gh run list` for our run on a branch.
@@ -763,18 +816,14 @@ def find_run(repo, branch, since_epoch, timeout_s=120,
         except json.JSONDecodeError:
             runs = []
         if runs:
-            def created_ts(x):
-                try:
-                    dt = datetime.datetime.fromisoformat(
-                        x["createdAt"].replace("Z", "+00:00"))
-                    return dt.timestamp()
-                except Exception:
-                    return 0
-            fresh = [x for x in runs if created_ts(x) >= since_epoch - 30]
+            fresh = [x for x in runs
+                     if _created_ts(x.get("createdAt", "")) >= since_epoch - 30]
             pool = fresh or runs
-            dispatch = [x for x in pool if x.get("event") == "workflow_dispatch"]
+            dispatch = [x for x in pool
+                        if x.get("event") == "workflow_dispatch"]
             chosen = sorted(dispatch or pool,
-                            key=created_ts, reverse=True)[0]
+                            key=lambda x: _created_ts(
+                                x.get("createdAt", "")), reverse=True)[0]
             return str(chosen["databaseId"])
         time.sleep(5)
     raise RuntimeError(f"timed out waiting for a workflow run on branch "
@@ -842,6 +891,7 @@ def main(argv=None):
     project_root = Path.cwd()
     build_id, branch = generate_build_id()
     artifact = f"{ARTIFACT_PREFIX}-{build_id}"
+    timer = Timer()
     log(f"build ID: {build_id}")
     log(f"branch:   {branch}")
     log(f"command:  {args.command}")
@@ -858,6 +908,8 @@ def main(argv=None):
         pulse_stop()
         say("interrupted; cancelling and cleaning up...")
         state.cleanup(cancel_first=True)
+        timer.mark("cleanup")
+        timer.report()
         sys.exit(130)
 
     old_int = signal.signal(signal.SIGINT, on_signal)
@@ -871,6 +923,7 @@ def main(argv=None):
         state.archive = tmppath
         archive = Path(tmppath)
         create_archive(project_root, archive)
+        timer.mark("archive")
 
         # 6-8. Clone build repo to temp dir, temp branch, upload contents.
         clone_dir = Path(tempfile.mkdtemp(prefix="remote-build-clone-"))
@@ -934,6 +987,7 @@ def main(argv=None):
         log(f"pushing temporary branch {branch}...")
         run(["git", *gh_cred, "push", "-u", "origin", branch],
             cwd=clone_dir)
+        timer.mark("upload")
 
         # 9-10. Trigger via documented workflow_dispatch on our ref.
         since = time.time()
@@ -955,12 +1009,15 @@ def main(argv=None):
         run_id = find_run(repo, branch, since_epoch=since)
         state.run_id = run_id
         say(f"run: https://github.com/{repo}/actions/runs/{run_id}")
+        timer.mark("trigger")
 
         # 12-13. Wait (showing the real run phase, not a blind spinner),
         # then print the compiler/build output.
         run_url = f"https://github.com/{repo}/actions/runs/{run_id}"
-        concl = poll_run_to_completion(repo, run_id, run_url,
-                                       timeout_mins=args.timeout_mins)
+        concl, queued_secs, build_secs = poll_run_to_completion(
+            repo, run_id, run_url, timeout_mins=args.timeout_mins)
+        timer.mark("queued", queued_secs)
+        timer.mark("remote build", build_secs)
         if not concl:
             err("timed out waiting for the remote build.")
             return 1
@@ -994,10 +1051,11 @@ def main(argv=None):
 
         # 14-16. Success: download the BINARY artifact by its own URL.
         # The run may also hold a cache-payload artifact (dependency
-        # tarballs for the seeder); it must never be mistaken for the
-        # binary. We resolve the artifact id via the API (waiting out
-        # listing lag), then fetch that exact zip -- the same bytes the
-        # Actions UI links to -- and extract it ourselves.
+        # tarballs from older seeder-era runs); it must never be
+        # mistaken for the binary. We resolve the artifact id via the
+        # API (waiting out listing lag), then fetch that exact zip --
+        # the same bytes the Actions UI links to -- and extract it
+        # ourselves.
         out_dir = (project_root / args.output)
         out_dir.mkdir(parents=True, exist_ok=True)
         before = {p.name for p in out_dir.iterdir()}
@@ -1027,6 +1085,7 @@ def main(argv=None):
             return 1
         purge_cache_payload(out_dir)
         flatten_output_dir(out_dir, before)
+        timer.mark("fetch")
         files = [p for p in out_dir.rglob("*") if p.is_file()]
         if not files:
             err("download produced no files.")
@@ -1044,7 +1103,8 @@ def main(argv=None):
         err("timed out waiting for the remote build.")
         return 1
     finally:
-        # 17-20. Always: delete run (artifact+logs), branch, local temps.
+        # 17-20. Always: delete run (artifact+logs), branch, local temps,
+        # then show how long everything took.
         try:
             state.cleanup(cancel_first=False)
         finally:
@@ -1053,6 +1113,8 @@ def main(argv=None):
                 signal.signal(signal.SIGTERM, old_term)
             except Exception:
                 pass
+        timer.mark("cleanup")
+        timer.report()
 
 
 if __name__ == "__main__":
