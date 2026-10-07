@@ -32,6 +32,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import zipfile
 from pathlib import Path
 
 DEFAULT_COMMAND = "cargo build --release"
@@ -533,6 +534,109 @@ def purge_cache_payload(out_dir):
             log(f"discarded cache payload: {p.name}")
 
 
+def download_artifact_zip(repo, artifact_id, artifact_name, out_dir,
+                          timeout=600, retries=3):
+    """Download one artifact by its API id (the same zip the Actions UI
+    links to: /actions/runs/<run>/artifacts/<id>) and extract it with
+    the standard library. Retries transient network failures. Returns
+    True on success. Never touches any other artifact.
+    """
+    last_err = ""
+    for attempt in range(1, retries + 1):
+        try:
+            proc = subprocess.run(
+                ["gh", "api",
+                 f"repos/{repo}/actions/artifacts/{artifact_id}/zip",
+                 "--repo", repo],
+                capture_output=True, timeout=timeout)
+            if proc.returncode != 0:
+                last_err = proc.stderr.decode(
+                    errors="replace").strip() or "gh api failed"
+                raise RuntimeError(last_err)
+            fd, tmppath = tempfile.mkstemp(prefix="remote-build-dl-",
+                                          suffix=".zip")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(proc.stdout)
+                with zipfile.ZipFile(tmppath) as zf:
+                    for member in zf.namelist():
+                        parts = Path(member).parts
+                        if member.startswith(("/", "\\")) or \
+                                ".." in parts:
+                            raise RuntimeError(
+                                f"unsafe zip member: {member}")
+                    zf.extractall(out_dir)
+            finally:
+                try:
+                    os.unlink(tmppath)
+                except OSError:
+                    pass
+            return True
+        except (RuntimeError, subprocess.TimeoutExpired,
+                zipfile.BadZipFile, OSError) as e:
+            last_err = str(e)
+            log(f"artifact download attempt {attempt}/{retries} failed "
+                f"({artifact_name}): {last_err}")
+            time.sleep(5 * attempt)
+    err(f"artifact download failed (nothing uploaded?). Last error: "
+        f"{last_err}")
+    return False
+
+
+def wait_for_binary_artifact(repo, run_id, artifact, timeout_s=300):
+    """Poll the run's artifact list until the binary artifact appears.
+
+    The listing can lag seconds behind run completion; without waiting,
+    a strict downloader mistakes a slow API for a missing artifact.
+    Returns (kind, artifact_id, name) where kind is one of:
+      exact        -- our artifact (id usable for direct download)
+      legacy       -- older naming (fixed name or another build id)
+      payload-only -- success with no binary (e.g. `cargo check`)
+      empty        -- no artifacts at all
+      unknown      -- API unreachable; caller decides
+    """
+    deadline = time.time() + timeout_s
+    last = ("unknown", None, None)
+    fallback = None
+    while time.time() < deadline:
+        try:
+            r = gh("api", f"repos/{repo}/actions/runs/{run_id}/artifacts",
+                   "--jq", ".artifacts[] | "
+                           "\\(.id) \\(.name) expired=\\(.expired)",
+                   timeout=120)
+            entries = []
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and "expired=true" not in line:
+                    entries.append((parts[0], parts[1]))
+        except RuntimeError:
+            time.sleep(10)
+            continue
+        names = {n for _, n in entries}
+        if artifact in names:
+            aid = next(a for a, n in entries if n == artifact)
+            return ("exact", aid, artifact)
+        # Remember legacy names but keep waiting: the exact artifact
+        # may simply be listed a few seconds later.
+        if fallback is None:
+            legacy = sorted({n for n in names
+                             if n == "remote-build-binary"
+                             or n.startswith("remote-build-binary-")})
+            if legacy:
+                aid = next(a for a, n in entries if n == legacy[0])
+                fallback = ("legacy", aid, legacy[0])
+                log(f"exact artifact name not found yet; will use "
+                    f"{legacy[0]} if it never appears...")
+        if any(n.startswith("cache-payload-") for n in names):
+            last = ("payload-only", None, None)
+        elif not names:
+            last = ("empty", None, None)
+        else:
+            last = ("unknown", None, None)
+        time.sleep(10)
+    return fallback or last
+
+
 def list_branch_runs(repo, branch, limit=10, workflow=WORKFLOW_FILE):
     """All run IDs on a branch (dispatch + push siblings). Never raises."""
     try:
@@ -1014,56 +1118,40 @@ def main(argv=None):
                 print(error_section(cleaned), end="")
             return 1
 
-        # 14-16. Success: download the BINARY artifact strictly by name.
+        # 14-16. Success: download the BINARY artifact by its own URL.
         # The run may also hold a cache-payload artifact (dependency
         # tarballs for the seeder); it must never be mistaken for the
-        # binary. Names are resolved via the API first, so at most one
-        # artifact is ever downloaded.
+        # binary. We resolve the artifact id via the API (waiting out
+        # listing lag), then fetch that exact zip -- the same bytes the
+        # Actions UI links to -- and extract it ourselves.
         out_dir = (project_root / args.output)
         out_dir.mkdir(parents=True, exist_ok=True)
         before = {p.name for p in out_dir.iterdir()}
-        try:
-            names = gh("api", f"repos/{repo}/actions/runs/{run_id}/"
-                              f"artifacts",
-                       "--jq", ".artifacts[].name",
-                       timeout=120).stdout.split()
-        except RuntimeError:
-            names = None
-        binary = None
-        if names is not None:
-            if artifact in names:
-                binary = artifact
-            else:
-                legacy = [n for n in names
-                          if n == "remote-build-binary"
-                          or n.startswith("remote-build-binary-")]
-                if legacy:
-                    binary = sorted(legacy)[0]
-                    log(f"exact artifact name not found; using {binary}...")
-        if binary is None:
-            # No binary artifact at all: either a check-type command
-            # (nothing to download -- still a success, and seeding can
-            # use the payload), or something is genuinely wrong.
-            has_payload = bool(names) and any(
-                n.startswith("cache-payload-") for n in names)
-            if has_payload:
-                say("remote build SUCCEEDED (no binary artifact: "
-                    "expected for check-type commands such as "
-                    "`cargo check`; nothing to download).")
-                seed_shared_cache(repo, run_id, slug, cache_key, apt_key,
-                                  state, no_seed=args.no_seed)
-                return 0
-            if names == []:
-                say("remote build SUCCEEDED (no artifacts uploaded; "
-                    "nothing to download).")
-                return 0
-            err("artifact download failed (nothing uploaded?).")
-            return 1
-        log(f"downloading artifact {binary}...")
-        dl = gh("run", "download", run_id, "--repo", repo,
-                "-n", binary, "-D", str(out_dir), check=False,
-                timeout=600)
-        if dl.returncode != 0:
+        kind, aid, aname = wait_for_binary_artifact(
+            repo, run_id, artifact)
+        if kind in ("exact", "legacy"):
+            log(f"downloading artifact {aname} (id {aid})...")
+            pulse_start("downloading binary")
+            try:
+                ok = download_artifact_zip(repo, aid, aname, out_dir)
+            finally:
+                pulse_stop()
+            if not ok:
+                return 1
+        elif kind == "payload-only":
+            # Check-type command: nothing to download -- still a
+            # success, and seeding can use the payload.
+            say("remote build SUCCEEDED (no binary artifact: "
+                "expected for check-type commands such as "
+                "`cargo check`; nothing to download).")
+            seed_shared_cache(repo, run_id, slug, cache_key, apt_key,
+                              state, no_seed=args.no_seed)
+            return 0
+        elif kind == "empty":
+            say("remote build SUCCEEDED (no artifacts uploaded; "
+                "nothing to download).")
+            return 0
+        else:
             err("artifact download failed (nothing uploaded?).")
             return 1
         purge_cache_payload(out_dir)
