@@ -546,8 +546,7 @@ def download_artifact_zip(repo, artifact_id, artifact_name, out_dir,
         try:
             proc = subprocess.run(
                 ["gh", "api",
-                 f"repos/{repo}/actions/artifacts/{artifact_id}/zip",
-                 "--repo", repo],
+                 f"repos/{repo}/actions/artifacts/{artifact_id}/zip"],
                 capture_output=True, timeout=timeout)
             if proc.returncode != 0:
                 last_err = proc.stderr.decode(
